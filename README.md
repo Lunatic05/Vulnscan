@@ -22,7 +22,8 @@ vulnscan/
 ├── database.py          # MySQL persistence layer
 ├── config.py            # API keys + DB credentials
 ├── vulnscan.docs        # Project Documentation
-└── requirements.txt
+├── .gitignore           # Exclude Files
+└── requirements.txt     # Required libraries
 ```
 
 ---
