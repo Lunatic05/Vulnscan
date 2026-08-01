@@ -239,6 +239,72 @@
               </div>
             </label>
           </div>
+
+          <!-- Authenticated Scanning -->
+          <div class="auth-panel" id="authPanel">
+            <div class="auth-panel-header" onclick="toggleAuthPanel()">
+              <div class="auth-panel-title">
+                <i class="fa fa-user-lock"></i>
+                <span>AUTHENTICATED SCANNING</span>
+                <span class="auth-mode-pill" id="authModePill">OFF</span>
+              </div>
+              <i class="fa fa-chevron-down auth-chevron" id="authChevron"></i>
+            </div>
+
+            <div class="auth-panel-body" id="authPanelBody" style="display:none">
+              <div class="auth-mode-tabs">
+                <button type="button" class="auth-mode-btn active" data-mode="none" onclick="setAuthMode('none')">
+                  <i class="fa fa-ban"></i> None
+                </button>
+                <button type="button" class="auth-mode-btn" data-mode="cookie" onclick="setAuthMode('cookie')">
+                  <i class="fa fa-cookie-bite"></i> Session Cookie
+                </button>
+                <button type="button" class="auth-mode-btn" data-mode="credentials" onclick="setAuthMode('credentials')">
+                  <i class="fa fa-key"></i> Credentials
+                </button>
+              </div>
+
+              <!-- Cookie mode -->
+              <div class="auth-mode-panel" id="authModeCookie" style="display:none">
+                <div class="si-desc">Paste a valid session cookie from an authenticated browser session (DevTools → Application → Cookies). It's attached to every request the scanner makes, including crawled pages.</div>
+                <textarea class="setting-input auth-textarea" id="authCookieStr" placeholder="sessionid=abc123; csrftoken=xyz789"></textarea>
+              </div>
+
+              <!-- Credentials mode -->
+              <div class="auth-mode-panel auth-grid" id="authModeCreds" style="display:none">
+                <div class="setting-item full">
+                  <div class="si-desc">The scanner auto-detects the login form, submits these credentials once, then reuses the resulting session for the entire scan.</div>
+                </div>
+                <div class="setting-item full">
+                  <div class="si-label">Login Page URL <span class="si-optional">(optional — defaults to target URL)</span></div>
+                  <input class="setting-input" id="authLoginUrl" placeholder="https://example.com/login" autocomplete="off" spellcheck="false" />
+                </div>
+                <div class="setting-item">
+                  <div class="si-label">Username / Email</div>
+                  <input class="setting-input" id="authUsername" placeholder="testuser@example.com" autocomplete="off" spellcheck="false" />
+                </div>
+                <div class="setting-item">
+                  <div class="si-label">Password</div>
+                  <input class="setting-input" id="authPassword" type="password" placeholder="••••••••" autocomplete="off" />
+                </div>
+                <details class="auth-advanced">
+                  <summary>Advanced: manual field names (only needed if auto-detection fails)</summary>
+                  <div class="auth-grid">
+                    <div class="setting-item">
+                      <div class="si-label">Username field name</div>
+                      <input class="setting-input" id="authUserField" placeholder="auto-detect" autocomplete="off" spellcheck="false" />
+                    </div>
+                    <div class="setting-item">
+                      <div class="si-label">Password field name</div>
+                      <input class="setting-input" id="authPassField" placeholder="auto-detect" autocomplete="off" spellcheck="false" />
+                    </div>
+                  </div>
+                </details>
+              </div>
+
+              <div class="auth-note"><i class="fa fa-triangle-exclamation"></i> Only use credentials or session cookies for accounts and systems you're authorized to test. They're used once to establish a session and are never written to disk.</div>
+            </div>
+          </div>
         </div>
 
         <!-- Terminal -->
@@ -274,6 +340,7 @@
               <div class="rsb-item"><span class="rsb-l">SCAN ID</span><span class="rsb-v accent" id="rScanId">—</span></div>
               <div class="rsb-item"><span class="rsb-l">DURATION</span><span class="rsb-v" id="rDuration">—</span></div>
               <div class="rsb-item"><span class="rsb-l">WAF</span><span class="rsb-v" id="rWaf">—</span></div>
+              <div class="rsb-item"><span class="rsb-l">AUTH</span><span class="rsb-v" id="rAuth" title="">—</span></div>
               <div class="rsb-item"><span class="rsb-l">RISK SCORE</span>
                 <span class="rsb-v risk-score-badge" id="rScore">—</span>
               </div>
@@ -383,8 +450,8 @@
                 <div class="si-desc">Domain breach detection · $3.50/mo · <a href="https://haveibeenpwned.com/API/Key" target="_blank">Get key</a></div>
                 <input class="setting-input" id="cfg_hibp" placeholder="Enter HIBP API key" type="password"/>
               </div>
-              <button class="btn-primary" style="margin-top:1rem" onclick="saveSettings()"><i class="fa fa-floppy-disk"></i> Save to config.py</button>
-              <div class="settings-note">Keys are saved to config.py on your server — never stored in the browser.</div>
+              <button class="btn-primary" style="margin-top:1rem" onclick="saveSettings()"><i class="fa fa-floppy-disk"></i> Save</button>
+              <div class="settings-note">Keys are saved on your server — never stored in the browser.</div>
             </div>
           </div>
           <div class="panel settings-panel">
