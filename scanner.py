@@ -279,6 +279,7 @@ class VulnScanner:
             "ssl_info": {},
             "waf": None,
             "threat_intel": {},
+            "auth": {"mode": (self.opts.get("auth") or {}).get("mode", "none"), "status": "not_attempted"},
             "score": 0,
         }
 
@@ -298,6 +299,208 @@ class VulnScanner:
         return any(
             hostname == domain.lstrip(".") or hostname.endswith(domain)
             for domain in TRUSTED_DOMAINS
+        )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Authenticated Scanning
+    #
+    # self.opts['auth'] can be:
+    #   {'mode': 'cookie', 'cookie': 'name1=value1; name2=value2'}
+    #   {'mode': 'credentials', 'login_url': '...', 'username': '...', 'password': '...',
+    #    'username_field': '...' (optional), 'password_field': '...' (optional)}
+    #
+    # Cookies applied here live on self.session (a requests.Session), so every
+    # subsequent request made through self.session — crawling, injection tests,
+    # sensitive-file checks, header checks, everything — automatically carries
+    # the authenticated session. That's what gives us cookie propagation across
+    # every crawled page for free, as long as this runs before crawling starts.
+    # ─────────────────────────────────────────────────────────────────────────
+    def _perform_authentication(self):
+        auth = self.opts.get('auth') or {}
+        mode = (auth.get('mode') or 'none').lower()
+        self.results['auth'] = {'mode': mode, 'status': 'not_attempted', 'detail': ''}
+
+        if mode == 'none':
+            return
+
+        print(f"[Auth] Mode: {mode}", flush=True)
+
+        if mode == 'cookie':
+            self._apply_session_cookie(auth)
+        elif mode == 'credentials':
+            self._login_with_credentials(auth)
+        else:
+            self.results['auth'].update(status='error', detail=f'Unknown auth mode: {mode}')
+
+        print(f"[Auth] {self.results['auth']['status']}: {self.results['auth'].get('detail', '')}", flush=True)
+
+    def _apply_session_cookie(self, auth):
+        """Parses a raw 'name=value; name2=value2' cookie string and attaches
+        each cookie to self.session, scoped to the target hostname."""
+        cookie_str = (auth.get('cookie') or '').strip()
+        if not cookie_str:
+            self.results['auth'].update(status='error', detail='No cookie value provided')
+            return
+
+        applied = []
+        for part in cookie_str.split(';'):
+            if '=' not in part:
+                continue
+            name, _, value = part.strip().partition('=')
+            name, value = name.strip(), value.strip().strip('"')
+            if not name:
+                continue
+            self.session.cookies.set(name, value, domain=self.hostname)
+            applied.append(name)
+
+        if applied:
+            self.results['auth'].update(
+                status='applied',
+                detail=f'{len(applied)} cookie(s) attached to session: {", ".join(applied)}',
+                cookie_names=applied,
+            )
+        else:
+            self.results['auth'].update(status='error', detail='Could not parse any cookies from input')
+
+    def _find_login_form(self, soup):
+        """Picks the most likely login form on a page: any form with a password
+        field, preferring ones whose action/id/class hints at login/signin/auth."""
+        forms = soup.find_all('form')
+        pw_forms = [f for f in forms if f.find('input', {'type': 'password'})]
+        if not pw_forms:
+            return None
+
+        def looks_like_login(f):
+            blob = ' '.join(str(f.get(attr, '')) for attr in ('action', 'id', 'class')).lower()
+            return any(k in blob for k in ('login', 'signin', 'sign-in', 'log-in', 'auth'))
+
+        pw_forms.sort(key=lambda f: 0 if looks_like_login(f) else 1)
+        return pw_forms[0]
+
+    def _build_login_payload(self, form, auth):
+        """Walks the form's fields, preserving hidden/default values (CSRF
+        tokens etc.) and identifying the username/password field names —
+        manual overrides from `auth` win if supplied, otherwise auto-detect."""
+        payload = {}
+        user_field = (auth.get('username_field') or '').strip() or None
+        pass_field = (auth.get('password_field') or '').strip() or None
+        username_hints = ('user', 'email', 'login', 'account', 'name')
+
+        for inp in form.find_all(['input', 'select', 'textarea']):
+            name = inp.get('name')
+            if not name:
+                continue
+            itype = (inp.get('type') or 'text').lower()
+
+            if itype == 'password':
+                if not pass_field:
+                    pass_field = name
+                continue  # never prefill — real password is set by the caller
+
+            if not user_field and itype in ('text', 'email') and any(h in name.lower() for h in username_hints):
+                user_field = name
+                continue
+
+            if itype in ('checkbox', 'radio'):
+                if inp.has_attr('checked'):
+                    payload[name] = inp.get('value', 'on')
+                continue
+
+            payload[name] = inp.get('value', '')  # preserves CSRF tokens, etc.
+
+        if not user_field:
+            for inp in form.find_all('input'):
+                itype = (inp.get('type') or 'text').lower()
+                if itype in ('text', 'email') and inp.get('name'):
+                    user_field = inp['name']
+                    break
+
+        return user_field, pass_field, payload
+
+    def _verify_login_success(self, resp):
+        """Best-effort heuristic: a real failure message beats everything else;
+        otherwise we look for a fresh session cookie and the login form going away."""
+        if resp.status_code >= 400:
+            return False, f'Login request returned HTTP {resp.status_code}'
+
+        body_lower = resp.text.lower()
+        fail_markers = (
+            'invalid username', 'invalid password', 'incorrect password',
+            'incorrect username', 'login failed', 'authentication failed',
+            'invalid credentials', 'wrong password', "doesn't match", 'does not match',
+        )
+        if any(m in body_lower for m in fail_markers):
+            return False, 'Login response contained an error message'
+
+        still_has_login_form = False
+        try:
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            still_has_login_form = bool(soup.find('input', {'type': 'password'}))
+        except Exception:
+            pass
+
+        has_session_cookie = len(self.session.cookies) > 0
+
+        if has_session_cookie and not still_has_login_form:
+            return True, 'Session cookie set and login form no longer present'
+        if has_session_cookie:
+            return True, 'Session cookie set (best-effort — a password field is still visible)'
+        return False, 'No session cookie was issued after login attempt'
+
+    def _login_with_credentials(self, auth):
+        username = (auth.get('username') or '').strip()
+        password = auth.get('password') or ''
+        login_url = (auth.get('login_url') or '').strip() or self.url
+
+        if not username or not password:
+            self.results['auth'].update(status='error', detail='Username and password are required')
+            return
+
+        try:
+            login_page = self.session.get(login_url, timeout=DEFAULT_TIMEOUT, allow_redirects=True)
+        except requests.RequestException as e:
+            self.results['auth'].update(status='error', detail=f'Could not load login page: {e}')
+            return
+
+        soup = BeautifulSoup(login_page.text, 'html.parser')
+        form = self._find_login_form(soup)
+        if not form:
+            self.results['auth'].update(
+                status='error',
+                detail=f'No login form (password field) found at {login_url}',
+            )
+            return
+
+        action = urllib.parse.urljoin(login_page.url, form.get('action') or login_page.url)
+        method = (form.get('method') or 'post').strip().lower()
+
+        user_field, pass_field, payload = self._build_login_payload(form, auth)
+        if not user_field or not pass_field:
+            self.results['auth'].update(
+                status='error',
+                detail='Could not identify username/password field names — try setting them manually',
+            )
+            return
+
+        payload[user_field] = username
+        payload[pass_field] = password
+
+        try:
+            if method == 'get':
+                resp = self.session.get(action, params=payload, timeout=DEFAULT_TIMEOUT, allow_redirects=True)
+            else:
+                resp = self.session.post(action, data=payload, timeout=DEFAULT_TIMEOUT, allow_redirects=True)
+        except requests.RequestException as e:
+            self.results['auth'].update(status='error', detail=f'Login request failed: {e}')
+            return
+
+        success, reason = self._verify_login_success(resp)
+        self.results['auth'].update(
+            status='success' if success else 'failed',
+            detail=reason,
+            login_url=action,
+            username_field=user_field,
+            cookies_set=len(self.session.cookies),
         )
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -446,6 +649,7 @@ class VulnScanner:
     # ─────────────────────────────────────────────────────────────────────────
     def run(self):
         print(f"[Scanner] Starting scan: {self.url}", flush=True)
+        self._perform_authentication()
 
         try:
             resp = self.session.get(self.url, allow_redirects=True, timeout=10)
@@ -509,7 +713,7 @@ class VulnScanner:
         self.results['threat_intel'] = threat_intel
         self.results['score'] = self._calc_risk_score()
         print(f"[Scanner] Finished scan: {self.url} "
-            f"({len(self.results['vulnerabilities'])} findings, score {self.results['score']})", flush=True)
+              f"({len(self.results['vulnerabilities'])} findings, score {self.results['score']})", flush=True)
         return {**self.results, 'status': 'complete', 'url': self.url}
     
     # ────────────────────────────────────────────────────────────────────────
@@ -727,7 +931,7 @@ class VulnScanner:
                     pass
 
         # ── A04 — Rate Limiting on Login ──────────────────────────────────────
-        if not self.is_trusted:
+        if not self.is_trusted and self.results.get('auth', {}).get('status') != 'success':
             login_forms = soup.find_all('form', action=lambda a: a and any(
                 x in str(a).lower() for x in ['login', 'signin', 'auth']))
             login_forms = login_forms or soup.find_all('form')
@@ -861,10 +1065,10 @@ class VulnScanner:
         Skips trusted domains entirely. Each finding ID is reported only once.
         """
         targets = self.discovered_urls or [self.url]
-        
-        if self._is_trusted_domain(target):
-            return # Skip injection checks on trusted domains
-        
+
+        if self.is_trusted:
+            return  # Skip injection checks on trusted domains
+
         print(f"Injection scan starting on {len(targets)} pages")
 
         found = {
@@ -898,8 +1102,6 @@ class VulnScanner:
                 baseline_text = baseline_resp.text
             except Exception:
                 baseline_text = ''
-                
-            r = self.session.get(test_url, timeout=8)
 
             test_params = self._extract_injectable_params(target, page_soup)
             test_params = {
