@@ -673,11 +673,11 @@ class VulnScanner:
         
         vuln['timestamp'] = datetime.now(timezone.utc).isoformat()
         
-        uid = (vuln.get('name'), vuln.get('name'), vuln.get('evidence'))
+        uid = (vuln.get('id'), vuln.get('name'), vuln.get('evidence'))
         
         with self._vuln_lock:
-            if uid not in self._vuln_ids:
-                return
+            if uid in self._vuln_ids:
+                return  # duplicate finding — already recorded
             
             self._vuln_ids.add(uid)
             self.results['vulnerabilities'].append(vuln)
@@ -1100,9 +1100,17 @@ class VulnScanner:
         body = response_body or ""
         
         return any(
-            pattern.search(body)
+            re.search(pattern, body, re.IGNORECASE)
             for pattern in SQL_ERROR_PATTERNS
         )
+        
+    # ─────────────────────────────────────────────────────────────────────────
+    
+    def _version_tuple(self, version_str): # Converts '3.5.0' -> (3, 5, 0) so versions compare numerically instead of as strings
+        
+        parts = re.findall(r"\d+", version_str or "")
+        
+        return tuple(int(p) for p in parts) or (0,)
         
     # ─────────────────────────────────────────────────────────────────────────
     
@@ -1173,7 +1181,6 @@ class VulnScanner:
     # ─────────────────────────────────────────────────────────────────────────
     
     def _check_owasp(self, response, headers, body, soup):
-        h = headers
         
         # Skip OWASP active checks on trusted domains
         if self.is_trusted:
