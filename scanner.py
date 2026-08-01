@@ -1,9 +1,11 @@
+from datetime import datetime, timezone
 from urllib import response
 import requests
 import socket
 import re
 import math
 import urllib.parse
+import posixpath
 import concurrent.futures
 import threading
 import time as t
@@ -19,7 +21,7 @@ import tldextract
 from collections import deque
 import html
 from urllib.parse import urlparse
-import time # tmp
+from urllib3.util.retry import Retry
 
 requests.packages.urllib3.disable_warnings()
 
@@ -88,6 +90,82 @@ SQL_ERROR_PATTERNS = (
     r"invalid input syntax",
     r"incorrect syntax near",
     r"sql syntax.*mysql",
+)
+
+SQL_ERROR_PAYLOADS = (
+    "'",
+    '"',
+    "')",
+    "';",
+    "' OR '1'='1",
+    '" OR "1"="1',
+    "'--",
+    "' OR 1=1--",
+    '" OR 1=1--',
+)
+
+SQL_BOOLEAN_PAYLOADS = (
+    (" AND 1=1", " AND 1=2"),
+    ("' AND '1'='1", "' AND '1'='2"),
+    ('" AND "1"="1', '" AND "1"="2'),
+    (" OR 1=1--", " OR 1=2--"),
+    ("' OR '1'='1'--", "' OR '1'='2'--"),
+    ('" OR "1"="1"--', '" OR "1"="2"--'),
+    (") AND (1=1", ") AND (1=2"),
+    ("')) AND (('1'='1", "')) AND (('1'='2"),
+)
+
+SQL_TIME_PAYLOADS = (
+    ("MySQL", "' AND SLEEP(3)-- "),
+    ("PostgreSQL", "';SELECT pg_sleep(3)--"),
+    ("MSSQL", "';WAITFOR DELAY '0:0:3'--"),
+    ("Oracle", "';DBMS_LOCK.SLEEP(3)--"),
+)
+
+CSRF_TOKEN_NAMES = {
+    'csrf',
+    '_csrf',
+    '_token',
+    'csrf_token',
+    'authenticity_token',
+    'nonce',
+    '__requestverificationtoken',
+    'csrfmiddlewaretoken',
+}
+
+XSS_PAYLOADS = (
+    "<script>alert(1)</script>",
+    '"><script>alert(1)</script>',
+    "'><script>alert(1)</script>",
+    "<img src=x onerror=alert(1)>",
+    "<svg/onload=alert(1)>",
+    "<body onload=alert(1)>",
+    '"><svg/onload=alert(1)>',
+    "'><svg/onload=alert(1)>",
+    "<iframe src=javascript:alert(1)>",
+    "<a href=javascript:alert(1)>click</a>",
+    "<input type=text value='><script>alert(1)</script>'>",
+    "<textarea><script>alert(1)</script></textarea>",
+    "<div style='display:none'><script>alert(1)</script></div>",
+    "<object data='javascript:alert(1)'></object>",
+    "<embed src='javascript:alert(1)'></embed>",
+    "<link rel='stylesheet' href='javascript:alert(1)'>",
+    "<meta http-equiv='refresh' content='0;url=javascript:alert(1)'>",
+)
+
+SSTI_PAYLOADS = (
+    ("{{7*7}}", "49"),
+    ("${7*7}", "49"),
+    ("#{7*7}", "49"),
+    ("<%=7*7%>", "49"),
+    ("{{1337-1288}}", "49"),
+    ("{{7*'7'}}", "7777777"),
+)
+
+LFI_PAYLOADS = (
+    "../../../../etc/passwd",
+    "..%2F..%2F..%2F..%2Fetc%2Fpasswd",
+    "..\\..\\..\\..\\windows\\win.ini",
 )
 
 BLACKLIST_PATHS = {
@@ -230,6 +308,17 @@ CONFIDENCE_WEIGHTS = {
 
 DEFAULT_TIMEOUT = 10  # seconds
 
+DEFAULT_PARAM_VALUE = '1'
+
+SKIP_PARAM_VALUES = (
+    "submit",
+    "login",
+    "send",
+    "change",
+    "go",
+    "search",
+)
+
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -237,10 +326,42 @@ DEFAULT_USER_AGENT = (
     "VulnScanner/1.0"
 )
 
-class _TimeoutAdapter(HTTPAdapter): # HTTPAdapter that applies a default timeout to all requests.
+COOKIE_ATTRIBUTES = {
+    "path",
+    "secure",
+    "httponly",
+    "samesite",
+    "domain",
+    "expires",
+    "max-age"
+}
+
+LOGOUT_PATHS = (
+    "/logout",
+    "/logoff",
+    "/signout",
+    "/sign-out",
+    "/signoff",
+)
+
+SRI_CDN_HINTS = (
+    "cdnjs.",
+    "jsdelivr.",
+    "unpkg.",
+    "code.jquery.com",
+    "ajax.googleapis.com",
+    "bootstrapcdn.",
+    "stackpath.",
+    "cdn."
+)
+
+from urllib3.util.retry import Retry
+
+class _TimeoutAdapter(HTTPAdapter):
+    """HTTPAdapter that applies a default timeout to all requests."""
 
     def __init__(self, timeout=DEFAULT_TIMEOUT, *args, **kwargs):
-        self._timeout = timeout
+        self._timeout = float(timeout)
         super().__init__(*args, **kwargs)
 
     def send(self, request, **kwargs):
@@ -249,27 +370,50 @@ class _TimeoutAdapter(HTTPAdapter): # HTTPAdapter that applies a default timeout
 
 
 class VulnScanner:
+
     def __init__(self, url, options=None):
         self.url = self._normalize_url(url)
-        self.opts = options or {}
-
+        
+        self.opts = {
+            "max_pages": 20,
+            "timeout": DEFAULT_TIMEOUT,
+            "crawl": True,
+            "port_scan": True,
+            "aggressive": False,
+            **(options or {}),
+        }
+        
         self.parsed = urllib.parse.urlparse(self.url)
         self.hostname = self.parsed.hostname or ""
         self.is_trusted = self._is_trusted_domain(self.url)
-
+        
         # HTTP session
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": DEFAULT_USER_AGENT,
             "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
             "Connection": "keep-alive",
         })
         self.session.verify = False
-
-        adapter = _TimeoutAdapter(timeout=DEFAULT_TIMEOUT)
+        
+        retry = Retry(
+            total=2,
+            connect=2,
+            read=1,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "HEAD", "OPTIONS"],
+        )
+        
+        adapter = _TimeoutAdapter(
+            timeout=self.opts["timeout"],
+            max_retries=retry,
+        )
+        
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
-
+        
         # Scan results
         self.results = {
             "vulnerabilities": [],
@@ -279,15 +423,18 @@ class VulnScanner:
             "ssl_info": {},
             "waf": None,
             "threat_intel": {},
-            "auth": {"mode": (self.opts.get("auth") or {}).get("mode", "none"), "status": "not_attempted"},
+            "auth": {
+                "mode": (self.opts.get("auth") or {}).get("mode", "none"),
+                "status": "not_attempted",
+            },
             "score": 0,
         }
-
+        
         # Internal state
         self.discovered_urls = []
         self._vuln_ids = set()
         self._vuln_lock = threading.Lock()
-
+        
     # ─────────────────────────────────────────────────────────────────────────
     def _is_trusted_domain(self, url):
         """
@@ -295,185 +442,186 @@ class VulnScanner:
         Matches both root domains and subdomains.
         """
         hostname = (urllib.parse.urlparse(url).hostname or "").lower()
-
+        
         return any(
             hostname == domain.lstrip(".") or hostname.endswith(domain)
             for domain in TRUSTED_DOMAINS
         )
-
+        
     # ─────────────────────────────────────────────────────────────────────────
-    # Authenticated Scanning
-    #
-    # self.opts['auth'] can be:
-    #   {'mode': 'cookie', 'cookie': 'name1=value1; name2=value2'}
-    #   {'mode': 'credentials', 'login_url': '...', 'username': '...', 'password': '...',
-    #    'username_field': '...' (optional), 'password_field': '...' (optional)}
-    #
-    # Cookies applied here live on self.session (a requests.Session), so every
-    # subsequent request made through self.session — crawling, injection tests,
-    # sensitive-file checks, header checks, everything — automatically carries
-    # the authenticated session. That's what gives us cookie propagation across
-    # every crawled page for free, as long as this runs before crawling starts.
-    # ─────────────────────────────────────────────────────────────────────────
+    
     def _perform_authentication(self):
-        auth = self.opts.get('auth') or {}
+        auth = self.opts.get("auth") or {}
         mode = (auth.get('mode') or 'none').lower()
-        self.results['auth'] = {'mode': mode, 'status': 'not_attempted', 'detail': ''}
-
+        self.results['auth'].update(mode=mode, status='not_attempted', detail='')
+        
         if mode == 'none':
+            self.results["auth"]["status"] = "disabled"
             return
-
-        print(f"[Auth] Mode: {mode}", flush=True)
-
+        
         if mode == 'cookie':
             self._apply_session_cookie(auth)
         elif mode == 'credentials':
             self._login_with_credentials(auth)
         else:
             self.results['auth'].update(status='error', detail=f'Unknown auth mode: {mode}')
-
+            
         print(f"[Auth] {self.results['auth']['status']}: {self.results['auth'].get('detail', '')}", flush=True)
-
-    def _apply_session_cookie(self, auth):
-        """Parses a raw 'name=value; name2=value2' cookie string and attaches
-        each cookie to self.session, scoped to the target hostname."""
+        
+    def _apply_session_cookie(self, auth): # Applies cookies from a string to the session
+        
         cookie_str = (auth.get('cookie') or '').strip()
         if not cookie_str:
             self.results['auth'].update(status='error', detail='No cookie value provided')
             return
-
+        
         applied = []
-        for part in cookie_str.split(';'):
+        for part in cookie_str.split(";"):
             if '=' not in part:
                 continue
-            name, _, value = part.strip().partition('=')
-            name, value = name.strip(), value.strip().strip('"')
+            name, value = part.split("=", 1)
+            name = name.strip()
+            value = value.strip().strip('"')
             if not name:
                 continue
-            self.session.cookies.set(name, value, domain=self.hostname)
+            self.session.cookies.set(name, value)
             applied.append(name)
-
+            
         if applied:
             self.results['auth'].update(
-                status='applied',
-                detail=f'{len(applied)} cookie(s) attached to session: {", ".join(applied)}',
+                status='success',
+                detail=f"{len(applied)} cookies loaded",
                 cookie_names=applied,
             )
         else:
-            self.results['auth'].update(status='error', detail='Could not parse any cookies from input')
-
-    def _find_login_form(self, soup):
-        """Picks the most likely login form on a page: any form with a password
-        field, preferring ones whose action/id/class hints at login/signin/auth."""
+            self.results['auth'].update(status='error', detail='No valid cookies could be parsed')
+            
+    def _find_login_form(self, soup): # Returns the form that most likely represents authentication
         forms = soup.find_all('form')
-        pw_forms = [f for f in forms if f.find('input', {'type': 'password'})]
-        if not pw_forms:
+        candidate = [form for form in forms if form.find('input', {'type': 'password'})]
+        
+        if not candidate:
             return None
-
-        def looks_like_login(f):
-            blob = ' '.join(str(f.get(attr, '')) for attr in ('action', 'id', 'class')).lower()
-            return any(k in blob for k in ('login', 'signin', 'sign-in', 'log-in', 'auth'))
-
-        pw_forms.sort(key=lambda f: 0 if looks_like_login(f) else 1)
-        return pw_forms[0]
-
-    def _build_login_payload(self, form, auth):
-        """Walks the form's fields, preserving hidden/default values (CSRF
-        tokens etc.) and identifying the username/password field names —
-        manual overrides from `auth` win if supplied, otherwise auto-detect."""
+        
+        keywords = ('login', 'signin', 'sign-in', 'log-in', 'auth', 'username', 'password')
+        
+        def score(form):
+            score = 0
+            text = ' '.join(str(form.get(attr, '')) for attr in ('action', 'id', 'class')).lower()
+            
+            if any(k in text for k in keywords):
+                score += 10
+            
+            if form.find('input', {'type': 'password'}):
+                score += 1
+                
+            return score
+        
+        candidate.sort(key=score, reverse=True)
+        return candidate[0]
+    
+    def _build_login_payload(self, form, auth): # Payload builder for login forms, preserving hidden fields and identifying username/password fields
+        
         payload = {}
         user_field = (auth.get('username_field') or '').strip() or None
         pass_field = (auth.get('password_field') or '').strip() or None
         username_hints = ('user', 'email', 'login', 'account', 'name')
-
+        
         for inp in form.find_all(['input', 'select', 'textarea']):
             name = inp.get('name')
             if not name:
                 continue
-            itype = (inp.get('type') or 'text').lower()
-
-            if itype == 'password':
+            input_type = (inp.get("type") or "text").lower()
+            
+            if input_type == 'password':
                 if not pass_field:
                     pass_field = name
                 continue  # never prefill — real password is set by the caller
-
-            if not user_field and itype in ('text', 'email') and any(h in name.lower() for h in username_hints):
+            
+            if not user_field and input_type in ('text', 'email') and any(h in name.lower() for h in username_hints):
                 user_field = name
                 continue
-
-            if itype in ('checkbox', 'radio'):
+            
+            if input_type in ('checkbox', 'radio'):
                 if inp.has_attr('checked'):
                     payload[name] = inp.get('value', 'on')
                 continue
-
+            
             payload[name] = inp.get('value', '')  # preserves CSRF tokens, etc.
-
+            
         if not user_field:
             for inp in form.find_all('input'):
-                itype = (inp.get('type') or 'text').lower()
-                if itype in ('text', 'email') and inp.get('name'):
+                if ((inp.get("type") or "text").lower() in ("text", "email") and inp.get("name")):
                     user_field = inp['name']
                     break
-
+                
         return user_field, pass_field, payload
-
-    def _verify_login_success(self, resp):
-        """Best-effort heuristic: a real failure message beats everything else;
-        otherwise we look for a fresh session cookie and the login form going away."""
-        if resp.status_code >= 400:
-            return False, f'Login request returned HTTP {resp.status_code}'
-
-        body_lower = resp.text.lower()
-        fail_markers = (
-            'invalid username', 'invalid password', 'incorrect password',
-            'incorrect username', 'login failed', 'authentication failed',
-            'invalid credentials', 'wrong password', "doesn't match", 'does not match',
+    
+    def _verify_login_success(self, response): # Best-effort login verification
+        
+        if response.status_code >= 400:
+            return False, f'HTTP {response.status_code}'
+        
+        body_lower = response.text.lower()
+        failure_markers = (
+            "invalid username",
+            "invalid password",
+            "incorrect password",
+            "incorrect username",
+            "login failed",
+            "authentication failed",
+            "invalid credentials",
+            "wrong password",
+            "access denied",
         )
-        if any(m in body_lower for m in fail_markers):
-            return False, 'Login response contained an error message'
-
-        still_has_login_form = False
+        if any(m in body_lower for m in failure_markers):
+            return False, 'Authentication failed'
+        
         try:
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            still_has_login_form = bool(soup.find('input', {'type': 'password'}))
+            soup = BeautifulSoup(response.text, 'html.parser')
+            login_form = soup.find("input", {"type": "password"}) is not None
         except Exception:
             pass
-
-        has_session_cookie = len(self.session.cookies) > 0
-
-        if has_session_cookie and not still_has_login_form:
-            return True, 'Session cookie set and login form no longer present'
-        if has_session_cookie:
-            return True, 'Session cookie set (best-effort — a password field is still visible)'
-        return False, 'No session cookie was issued after login attempt'
-
+        
+        cookies = len(self.session.cookies)
+        
+        redirected = response.history != []
+        
+        if cookies and not login_form:
+            return True, 'Authenticated successfully'
+        if redirected and not login_form:
+            return True, 'Redirected after login'
+        if cookies:
+            return True, 'Session cookie detected'
+        return False, 'Unable to verify authentication'
+    
     def _login_with_credentials(self, auth):
         username = (auth.get('username') or '').strip()
         password = auth.get('password') or ''
-        login_url = (auth.get('login_url') or '').strip() or self.url
-
+        login_url = (auth.get('login_url') or self.url).strip()
+        
         if not username or not password:
             self.results['auth'].update(status='error', detail='Username and password are required')
             return
-
+        
         try:
-            login_page = self.session.get(login_url, timeout=DEFAULT_TIMEOUT, allow_redirects=True)
+            login_page = self.session.get(login_url, allow_redirects=True)
         except requests.RequestException as e:
-            self.results['auth'].update(status='error', detail=f'Could not load login page: {e}')
+            self.results['auth'].update(status='error', detail=f'Unable to load login page: {e}')
             return
-
+        
         soup = BeautifulSoup(login_page.text, 'html.parser')
         form = self._find_login_form(soup)
         if not form:
             self.results['auth'].update(
                 status='error',
-                detail=f'No login form (password field) found at {login_url}',
+                detail=f'Login form not found on {login_url}',
             )
             return
-
+        
         action = urllib.parse.urljoin(login_page.url, form.get('action') or login_page.url)
         method = (form.get('method') or 'post').strip().lower()
-
+        
         user_field, pass_field, payload = self._build_login_payload(form, auth)
         if not user_field or not pass_field:
             self.results['auth'].update(
@@ -481,48 +629,93 @@ class VulnScanner:
                 detail='Could not identify username/password field names — try setting them manually',
             )
             return
-
+        
         payload[user_field] = username
         payload[pass_field] = password
-
+        
         try:
             if method == 'get':
-                resp = self.session.get(action, params=payload, timeout=DEFAULT_TIMEOUT, allow_redirects=True)
+                response = self.session.get(action, params=payload, allow_redirects=True)
             else:
-                resp = self.session.post(action, data=payload, timeout=DEFAULT_TIMEOUT, allow_redirects=True)
+                response = self.session.post(action, data=payload, allow_redirects=True)
         except requests.RequestException as e:
             self.results['auth'].update(status='error', detail=f'Login request failed: {e}')
             return
-
-        success, reason = self._verify_login_success(resp)
+        
+        success, reason = self._verify_login_success(response)
         self.results['auth'].update(
             status='success' if success else 'failed',
             detail=reason,
             login_url=action,
             username_field=user_field,
             cookies_set=len(self.session.cookies),
+            response_code=response.status_code,
+            final_url=response.url,
         )
-
+        
     # ─────────────────────────────────────────────────────────────────────────
-    def _add(self, vuln):
-        """Thread-safe, deduplicated vulnerability registration."""
+    
+    def _add(self, vuln): # Thread-safe vulnerability registration with deduplication
+        
+        vuln.setdefault('id', 'UNKNOWN')
+        vuln.setdefault('category', 'general')
+        vuln.setdefault('name', 'Unnamed Vulnerability')
+        vuln.setdefault('severity', 'info')
         vuln.setdefault('confidence', 'medium')
-        uid = vuln.get('id', vuln.get('name', ''))
+        vuln.setdefault('description', '')
+        vuln.setdefault('impact', '')
+        vuln.setdefault('recommendation', '')
+        vuln.setdefault('evidence', '')
+        vuln.setdefault('cvss', '0.0')
+        
+        vuln['severity'] = vuln['severity'].lower()
+        vuln['confidence'] = vuln['confidence'].lower()
+        
+        vuln['timestamp'] = datetime.now(timezone.utc).isoformat()
+        
+        uid = (vuln.get('name'), vuln.get('name'), vuln.get('evidence'))
+        
         with self._vuln_lock:
             if uid not in self._vuln_ids:
-                self._vuln_ids.add(uid)
-                self.results['vulnerabilities'].append(vuln)
-
+                return
+            
+            self._vuln_ids.add(uid)
+            self.results['vulnerabilities'].append(vuln)
+            
     # ─────────────────────────────────────────────────────────────────────────
-
-    def _normalize_url(self, url): # Normalizes URLs to reduce duplicates
+    
+    def _normalize_url(self, url): # Normalizes a URL to a canonical form for consistent comparison and deduplication
+        
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+            
         parsed = urllib.parse.urlparse(url)
-
-        path = parsed.path.rstrip("/") or "/"
-
+        
+        scheme = parsed.scheme.lower()
+        
+        hostname = (parsed.hostname or "").lower()
+        
+        port = parsed.port
+        
+        if (scheme == "http" and port == 80) or \
+        (scheme == "https" and port == 443):
+            netloc = hostname
+        elif port:
+            netloc = f"{hostname}:{port}"
+        else:
+            netloc = hostname
+            
+        path = posixpath.normpath(parsed.path or "/")
+        
+        if not path.startswith("/"):
+            path = "/" + path
+            
+        if path != "/":
+            path = path.rstrip("/")
+            
         return urllib.parse.urlunparse((
-            parsed.scheme.lower(),
-            parsed.netloc.lower(),
+            scheme,
+            netloc,
             path,
             "",
             parsed.query,
@@ -530,1097 +723,2000 @@ class VulnScanner:
         ))
         
     # ─────────────────────────────────────────────────────────────────────────
-
-    def _crawl(self, max_pages=20, max_depth=3): # Crawls the target domain for additional URLs to scan
-
+    
+    def _crawl(self, max_pages=20, max_depth=3): # Crawls the target website to discover internal links and form actions, returning a list of discovered URLs
+        
         discovered = []
         visited = set()
         seen = set()
-
+        
         queue = deque([(self.url, 0)])
-
+        
         seen.add(self._normalize_url(self.url))
-
+        
         while queue and len(discovered) < max_pages:
-
             current, depth = queue.popleft()
-
             if depth > max_depth:
                 continue
-
+            
             try:
                 r = self.session.get(
                     current,
-                    timeout=6,
+                    timeout=DEFAULT_TIMEOUT,
                     allow_redirects=True
                 )
-
             except requests.RequestException:
                 continue
-
+            
             if r.status_code >= 400:
                 continue
-
+            
+            # Ensure redirects stay inside the target domain
+            redirected = urllib.parse.urlparse(r.url)
+            
+            if redirected.netloc.lower() != self.parsed.netloc.lower():
+                continue
+            
             current = self._normalize_url(r.url)
-
+            
             if current in visited:
                 continue
-
+            
             visited.add(current)
-
+            
             content_type = r.headers.get("Content-Type", "").lower()
-
-            if not (
-                "text/html" in content_type
-                or "application/xhtml+xml" in content_type
-            ):
+            
+            if not (content_type.startswith("text/html") or content_type.startswith("application/xhtml+xml")):
                 continue
-
+            
             discovered.append(current)
-
+            
             soup = BeautifulSoup(r.text, "html.parser")
-
-            # -------------------------
-            # Collect <a href="">
-            # -------------------------
-            for tag in soup.find_all("a", href=True):
-
+            
+            for tag in soup.find_all("a", href=True): # Collect hyperlinks
+                
                 href = tag["href"].strip()
-
-                if href.startswith((
-                    "mailto:",
-                    "javascript:",
-                    "tel:",
-                    "data:",
-                    "ftp:"
-                )):
+                
+                if not href:
                     continue
-
+                
+                if href.startswith(("mailto:","javascript:","tel:","data:","ftp:")):
+                    continue
+                
                 href = urllib.parse.urljoin(current, href)
-                href = href.split("#")[0]
-
+                
+                # Remove fragment (#section)
+                href = urllib.parse.urldefrag(href).url
+                
                 parsed = urllib.parse.urlparse(href)
-
-                if parsed.netloc != self.parsed.netloc:
+                
+                # Internal links only
+                if parsed.netloc.lower() != self.parsed.netloc.lower():
                     continue
-
+                
+                # Never crawl logout pages
+                if any(
+                    parsed.path.lower().endswith(p)
+                    for p in LOGOUT_PATHS
+                ):
+                    continue
+                
                 filename = parsed.path.split("/")[-1].lower()
-
+                
                 if "." in filename:
                     ext = "." + filename.rsplit(".", 1)[-1]
                     if ext in SKIP_EXTENSIONS:
                         continue
-
+                    
                 if any(x in parsed.path.lower() for x in BLACKLIST_PATHS):
                     continue
-
-                href = self._normalize_url(href)
-
-                if href not in seen:
-                    seen.add(href)
-                    queue.append((href, depth + 1))
-
-            # -------------------------
-            # Collect form actions
-            # -------------------------
-            for form in soup.find_all("form"):
-
+                
+                # Ignore query parameters during crawling
+                crawl_url = urllib.parse.urlunparse((parsed.scheme,parsed.netloc,parsed.path,"","",""))
+                
+                crawl_url = self._normalize_url(crawl_url)
+                
+                if crawl_url not in seen:
+                    seen.add(crawl_url)
+                    queue.append((crawl_url, depth + 1))
+                    
+            for form in soup.find_all("form"): # Collect form actions
+                
                 action = form.get("action")
-
+                
                 if not action:
                     continue
-
+                
                 action = urllib.parse.urljoin(current, action)
-                action = action.split("#")[0]
-
+                action = urllib.parse.urldefrag(action).url
+                
                 parsed = urllib.parse.urlparse(action)
-
-                if parsed.netloc != self.parsed.netloc:
+                
+                if parsed.netloc.lower() != self.parsed.netloc.lower():
                     continue
-
-                action = self._normalize_url(action)
-
-                if action not in seen:
-                    seen.add(action)
-                    queue.append((action, depth + 1))
-
+                
+                if any(
+                    parsed.path.lower().endswith(p)
+                    for p in LOGOUT_PATHS
+                ):
+                    continue
+                
+                crawl_url = urllib.parse.urlunparse((parsed.scheme,parsed.netloc,parsed.path,"","",""))
+                
+                crawl_url = self._normalize_url(crawl_url)
+                
+                if crawl_url not in seen:
+                    seen.add(crawl_url)
+                    queue.append((crawl_url, depth + 1))
+                    
         return discovered
-
+    
     # ─────────────────────────────────────────────────────────────────────────
+    
     def run(self):
         print(f"[Scanner] Starting scan: {self.url}", flush=True)
+        
+        # Authentication
         self._perform_authentication()
-
+        
         try:
-            resp = self.session.get(self.url, allow_redirects=True, timeout=10)
-        except Exception as e:
-            return {**self.results, 'error': str(e), 'status': 'error'}
-
-        headers = resp.headers
-        body = resp.text
-        soup = BeautifulSoup(body, 'html.parser')
-
-        # Only crawl non-trusted domains to save time
-        if not self.is_trusted:
-            self.discovered_urls = self._crawl()
-        else:
+            response = self.session.get(
+                self.url,
+                allow_redirects=True,
+                timeout=DEFAULT_TIMEOUT,
+            )
+        except requests.RequestException as e:
+            return {
+                **self.results,
+                "status": "error",
+                "error": str(e),
+            }
+            
+        headers = response.headers
+        body = response.text
+        soup = BeautifulSoup(body, "html.parser")
+        
+        # Crawl only non-trusted targets
+        if self.is_trusted:
             self.discovered_urls = [self.url]
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
-            futures = {}
-
-            if self.opts.get('scan_owasp', True):
-                futures['owasp'] = ex.submit(self._check_owasp, resp, headers, body, soup)
-
-            if self.opts.get('scan_injection', True) and not self.is_trusted:
-                futures['injection'] = ex.submit(self._check_injection, resp, soup)
-
-            if self.opts.get('scan_ports', True):
-                futures['ports'] = ex.submit(self._scan_ports)
-
-            if self.opts.get('scan_tech', True):
-                futures['tech'] = ex.submit(self._detect_tech, headers, body)
-
-            if self.opts.get('scan_ssl', True):
-                futures['ssl'] = ex.submit(self._check_ssl)
-
-            if self.opts.get('scan_dns', True):
-                futures['dns'] = ex.submit(self._check_dns)
-
-            futures['waf'] = ex.submit(self._detect_waf, headers, body)
-            futures['files'] = ex.submit(self._check_sensitive_files)
-            futures['methods'] = ex.submit(self._check_http_methods)
-            futures['cookies'] = ex.submit(self._check_cookies, resp)
-            futures['cors'] = ex.submit(self._check_cors)
-            futures['redirect'] = ex.submit(self._check_open_redirect)
-
-            if self.opts.get('scan_threat_intel', True):
-                futures['vt'] = ex.submit(check_virustotal, self.url)
-                futures['shodan'] = ex.submit(check_shodan, self.hostname)
-                futures['gsb'] = ex.submit(check_google_safe_browsing, self.url)
-                futures['hibp'] = ex.submit(check_hibp_domain, self.hostname)
-
-            concurrent.futures.wait(futures.values())
-
+        else:
+            self.discovered_urls = self._crawl()
+            
+        futures = {}
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+            
+            if self.opts.get("scan_owasp", True):
+                futures["owasp"] = executor.submit(
+                    self._check_owasp,
+                    response,
+                    headers,
+                    body,
+                    soup,
+                )
+                
+            if self.opts.get("scan_injection", True) and not self.is_trusted:
+                futures["injection"] = executor.submit(
+                    self._check_injection,
+                    response,
+                    soup,
+                )
+                
+            if self.opts.get("scan_ports", True):
+                futures["ports"] = executor.submit(self._scan_ports)
+                
+            if self.opts.get("scan_tech", True):
+                futures["tech"] = executor.submit(
+                    self._detect_tech,
+                    headers,
+                    body,
+                )
+                
+            if self.opts.get("scan_ssl", True):
+                futures["ssl"] = executor.submit(self._check_ssl)
+                
+            if self.opts.get("scan_dns", True):
+                futures["dns"] = executor.submit(self._check_dns)
+                
+            futures["waf"] = executor.submit(
+                self._detect_waf,
+                headers,
+                body,
+            )
+            
+            futures["files"] = executor.submit(
+                self._check_sensitive_files,
+            )
+            
+            futures["methods"] = executor.submit(
+                self._check_http_methods,
+            )
+            
+            futures["cookies"] = executor.submit(
+                self._check_cookies,
+                response,
+            )
+            
+            futures["cors"] = executor.submit(
+                self._check_cors,
+            )
+            
+            futures["redirect"] = executor.submit(
+                self._check_open_redirect,
+            )
+            
+            if self.opts.get("scan_threat_intel", True):
+                futures["vt"] = executor.submit(
+                    check_virustotal,
+                    self.url,
+                )
+                
+                futures["shodan"] = executor.submit(
+                    check_shodan,
+                    self.hostname,
+                )
+                
+                futures["gsb"] = executor.submit(
+                    check_google_safe_browsing,
+                    self.url,
+                )
+                
+                futures["hibp"] = executor.submit(
+                    check_hibp_domain,
+                    self.hostname,
+                )
+                
+            # Wait for all tasks and surface exceptions
+            for name, future in futures.items():
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"[{name}] {e}", flush=True)
+                    
+        # Collect threat intelligence
         threat_intel = {}
-        for key in ('vt', 'shodan', 'gsb', 'hibp'):
+        
+        for key in ("vt", "shodan", "gsb", "hibp"):
             if key in futures:
                 try:
                     threat_intel[key] = futures[key].result()
                 except Exception:
-                    pass
-
-        self.results['threat_intel'] = threat_intel
-        self.results['score'] = self._calc_risk_score()
-        print(f"[Scanner] Finished scan: {self.url} "
-              f"({len(self.results['vulnerabilities'])} findings, score {self.results['score']})", flush=True)
-        return {**self.results, 'status': 'complete', 'url': self.url}
-    
-    # ────────────────────────────────────────────────────────────────────────
-    # Debug code
-
+                    threat_intel[key] = None
+                    
+        self.results["threat_intel"] = threat_intel
+        self.results["score"] = self._calc_risk_score()
+        
+        print(
+            f"[Scanner] Finished scan: {self.url} "
+            f"({len(self.results['vulnerabilities'])} findings, "
+            f"score {self.results['score']})",
+            flush=True,
+        )
+        
+        return {
+            **self.results,
+            "status": "complete",
+            "url": self.url,
+        }
+        
     # ─────────────────────────────────────────────────────────────────────────
-    def _extract_injectable_params(self, target_url, page_soup):
-        """
-        Return {param: default_value} for params safe to inject into.
-        Excludes buttons, CSRF tokens, and non-text inputs.
-        """
+    
+    def _extract_injectable_params(self, target_url, page_soup): # Extract Injectable Parameters
+        
         parsed = urllib.parse.urlparse(target_url)
         params = {}
-
-        # URL query params
-        for key, vals in urllib.parse.parse_qs(parsed.query).items():
+        
+        for key, values in urllib.parse.parse_qs(parsed.query).items(): # URL Query Parameters
+            
             if key.lower() in SKIP_PARAMS:
                 continue
-            val = vals[0] if vals else '1'
-            if val.lower() in ('submit', 'login', 'send', 'change', 'go', 'search'):
+            
+            value = values[0] if values else DEFAULT_PARAM_VALUE
+            
+            if value.lower() in SKIP_PARAM_VALUES:
                 continue
-            params[key] = val
-
-        # Form inputs
-        for form in page_soup.find_all('form'):
-            for inp in form.find_all(['input', 'textarea', 'select']):
-                name = (inp.get('name') or '').strip()
+            
+            params[key] = value
+            
+        for form in page_soup.find_all("form"): # Form Parameters
+            
+            for field in form.find_all(["input", "textarea", "select"]):
+                
+                name = (field.get("name") or "").strip()
+                
                 if not name:
                     continue
-                itype = inp.get('type', 'text').lower()
-                if itype in ('submit', 'button', 'image', 'reset', 'file', 'checkbox', 'radio', 'hidden'):
-                    continue
+                
                 if name.lower() in SKIP_PARAMS:
                     continue
-                default = (inp.get('value') or '').strip() or '1'
-                if default.lower() in ('submit', 'login', 'send', 'change', 'go'):
+                
+                if field.has_attr("disabled"):
                     continue
-                params[name] = default
-
+                
+                if field.has_attr("readonly"):
+                    continue
+                
+                field_type = (field.get("type") or "text").lower()
+                
+                if field_type in {
+                    "submit",
+                    "button",
+                    "image",
+                    "reset",
+                    "file",
+                    "checkbox",
+                    "radio",
+                    "hidden",
+                }:
+                    continue
+                
+                # Handle <select>
+                if field.name == "select":
+                    option = field.find("option", selected=True)
+                    
+                    if option is None:
+                        option = field.find("option")
+                        
+                    value = (
+                        option.get("value", "").strip()
+                        if option
+                        else DEFAULT_PARAM_VALUE
+                    )
+                    
+                else:
+                    value = (
+                        field.get("value", "").strip()
+                        or DEFAULT_PARAM_VALUE
+                    )
+                    
+                if value.lower() in SKIP_PARAM_VALUES:
+                    continue
+                
+                # Preserve query parameter value if already present
+                params.setdefault(name, value)
+                
         return params
-
+    
     # ─────────────────────────────────────────────────────────────────────────
-    def _is_db_param(self, param_key, target_url):
-        """Heuristic: does this param/URL likely interact with a database?"""
-        if param_key.lower() in DB_PARAM_HINTS:
+    
+    def _is_db_param(self, param_key, target_url): # Returns True if the parameter name or URL path suggests a database-backed endpoint
+        
+        param_name = (param_key or "").lower()
+        
+        if param_name in DB_PARAM_HINTS:
             return True
-        path = urllib.parse.urlparse(target_url).path.lower()
-        return any(hint in path for hint in DB_PATH_HINTS)
-
+        
+        url_path = urllib.parse.urlparse(target_url).path.lower()
+        
+        return any(
+            hint in url_path
+            for hint in DB_PATH_HINTS
+        )
+        
     # ─────────────────────────────────────────────────────────────────────────
-    def _baseline_has_sql_error(self, text):
-        """True if the unmodified page already contains a SQL error string."""
-        tl = text.lower()
-        return any(re.search(p, tl) for p in SQL_ERROR_PATTERNS)
-
+    
+    def _baseline_has_sql_error(self, response_body): # Returns True if the original page already contains SQL error messages
+        
+        body = response_body or ""
+        
+        return any(
+            pattern.search(body)
+            for pattern in SQL_ERROR_PATTERNS
+        )
+        
     # ─────────────────────────────────────────────────────────────────────────
-    def _check_xss_context(self, response_body, payload):
-        """
-        Returns True only if the raw (unescaped) payload appears inside an
-        executable HTML context — a <script> block, an event-handler attribute,
-        or a javascript: URI — not merely as visible page text.
-        """
+    
+    def _check_xss_context(self, response_body, payload): # Returns True if the payload appears in an executable HTML context (script block, event handler, or javascript: URI)
+        
         body_lower = response_body.lower()
         payload_lower = payload.lower()
+        
         idx = body_lower.find(payload_lower)
         if idx == -1:
             return False
-
-        # Must not be HTML-entity-encoded
-        segment = response_body[idx: idx + len(payload) + 5]
-        if '&lt;' in segment or '&gt;' in segment or '&#' in segment:
+        
+        # Reject HTML-encoded payloads
+        segment = body_lower[idx: idx + len(payload_lower) + 10]
+        
+        if any(ent in segment for ent in (
+            "&lt;",
+            "&gt;",
+            "&#",
+            "&quot;",
+            "&apos;",
+            "&amp;"
+        )):
             return False
-
-        # Context window before the payload
-        pre = body_lower[max(0, idx - 300): idx]
-        post = body_lower[idx: min(len(body_lower), idx + len(payload_lower) + 50)]
-
-        # Inside a <script>...</script> block?
-        last_script_open = pre.rfind('<script')
-        last_script_close = pre.rfind('</script>')
+        
+        context_before = body_lower[max(0, idx - 300): idx]
+        context_after = body_lower[
+            idx: min(len(body_lower), idx + len(payload_lower) + 100)
+        ]
+        
+        context = context_before + context_after
+        
+        # Inside <script>...</script>
+        last_script_open = context_before.rfind("<script")
+        last_script_close = context_before.rfind("</script>")
+        
         if last_script_open != -1 and last_script_open > last_script_close:
             return True
-
-        # Payload IS a script tag pair and it is unencoded
-        if '<script>' in payload_lower and '</script>' in payload_lower:
+        
+        # Payload itself is a script tag
+        if "<script>" in payload_lower and "</script>" in payload_lower:
             return True
-
-        # Inside an event handler attribute value
-        event_attrs = ('onerror=', 'onload=', 'onclick=', 'onmouseover=',
-                        'onfocus=', 'onblur=', 'oninput=', 'onsubmit=')
-        if any(ev in post for ev in event_attrs):
+        
+        # Event handler attribute
+        event_attrs = (
+            "onerror=",
+            "onload=",
+            "onclick=",
+            "onmouseover=",
+            "onfocus=",
+            "onblur=",
+            "oninput=",
+            "onsubmit=",
+            "onanimationstart=",
+            "onpointerenter=",
+            "onmouseenter=",
+        )
+        
+        if any(attr in context for attr in event_attrs):
             return True
-        if any(ev in payload_lower for ev in event_attrs):
+        
+        # javascript: URI
+        if "javascript:" in context:
             return True
-
-        # Inside a javascript: URI
-        if 'javascript:' in payload_lower:
-            surround = pre[-30:] + post[:30]
-            if 'href=' in surround or 'src=' in surround or 'action=' in surround:
-                return True
-
+        
         return False
-
+    
     # ─────────────────────────────────────────────────────────────────────────
-    def _check_owasp(self, resp, headers, body, soup):
+    
+    def _check_owasp(self, response, headers, body, soup):
         h = headers
         
-        targets_owasp = self.discovered_urls or [self.url]
+        # Skip OWASP active checks on trusted domains
+        if self.is_trusted:
+            return
         
-        if self._is_trusted_domain(targets_owasp):
-            return # Skip OWASP checks on trusted domains
-
+        baseline = response.text[:5000]
+        
         # ── A01 — Broken Access Control ──────────────────────────────────────
-        if not self.is_trusted:
-            admin_paths = ['/admin', '/admin/users', '/dashboard', '/api/users', '/api/admin']
-            for path in admin_paths:
+        admin_paths = (
+            "/admin",
+            "/admin/users",
+            "/dashboard",
+            "/api/users",
+            "/api/admin",
+        )
+        
+        admin_keywords = (
+            "admin dashboard",
+            "administrator",
+            "user management",
+            "control panel",
+            "role management",
+            "site settings",
+        )
+        
+        for path in admin_paths:
+            admin_url = urllib.parse.urljoin(self.url, path)
+            
+            try:
+                r = self.session.get(
+                    admin_url,
+                    allow_redirects=False,
+                    timeout=DEFAULT_TIMEOUT,
+                )
+            except requests.RequestException:
+                continue
+            
+            similarity = difflib.SequenceMatcher(
+                None,
+                baseline,
+                r.text[:5000],
+            ).ratio()
+            
+            body_lower = r.text.lower()
+            
+            if (
+                r.status_code == 200
+                and len(r.text) > 500
+                and similarity < 0.70
+                and any(keyword in body_lower for keyword in admin_keywords)
+            ):
+                self._add({
+                    "id": "A01-BAC",
+                    "owasp_id": "A01:2025",
+                    "category": "owasp",
+                    "name": "Broken Access Control",
+                    "severity": "medium",
+                    "confidence": "low",
+                    "description": f"Potentially sensitive endpoint accessible without authentication: {path}",
+                    "impact": "Unauthenticated users may be able to access privileged functionality.",
+                    "recommendation": "Enforce server-side authorization on every protected endpoint.",
+                    "evidence": (
+                        f"URL: {admin_url}\n"
+                        f"Method: GET\n"
+                        f"Status: {r.status_code}\n"
+                        f"Size: {len(r.text)} bytes"
+                    ),
+                    "cvss": "5.3",
+                })
+                break
+            
+        # ── IDOR (Insecure Direct Object Reference) ──────────────────────────
+        if self.parsed.query:
+            params = urllib.parse.parse_qs(self.parsed.query)
+            
+            for key, values in params.items():
+                if not values or not values[0].isdigit():
+                    continue
+                
+                original_id = values[0]
+                modified_id = str(int(original_id) + 1)
+                
+                new_params = dict(params)
+                new_params[key] = [modified_id]
+                
+                test_url = self.parsed._replace(
+                    query=urllib.parse.urlencode(new_params, doseq=True)
+                ).geturl()
+                
                 try:
-                    r = self.session.get(self.url + path, allow_redirects=False, timeout=6)
-                    sim = difflib.SequenceMatcher(None, resp.text[:5000], r.text[:5000]).ratio()
-                    admin_kw = ['admin dashboard', 'user management', 'administrator',
-                                'control panel', 'role management', 'site settings']
-                    if (r.status_code == 200 and len(r.text) > 500
-                            and sim < 0.70
-                            and any(k in r.text.lower() for k in admin_kw)):
-                        self._add({
-                            'id': 'A01-BAC', 'owasp_id': 'A01:2025', 'category': 'owasp',
-                            'name': 'Broken Access Control',
-                            'severity': 'medium', 'confidence': 'low',
-                            'description': f'Sensitive endpoint accessible without authentication: {path}',
-                            'impact': 'Unauthenticated access to admin functions, data exfiltration',
-                            'recommendation': 'Implement deny-by-default RBAC. Verify every request server-side.',
-                            'evidence': f'GET {self.url + path} → HTTP 200 ({len(r.text)} bytes)',
-                            'cvss': '5.3',
-                        })
-                        break
-                except Exception:
-                    pass
-
-            # IDOR — numeric IDs
-            if '?' in self.url:
-                params = urllib.parse.parse_qs(self.parsed.query)
-                for key, vals in params.items():
-                    if vals and vals[0].isdigit():
-                        test_id = str(int(vals[0]) + 1)
-                        test_url = self.url.replace(f'{key}={vals[0]}', f'{key}={test_id}')
-                        try:
-                            r = self.session.get(test_url, timeout=6)
-                            sim = difflib.SequenceMatcher(None, resp.text[:5000], r.text[:5000]).ratio()
-                            if r.status_code == 200 and len(r.text) > 500 and sim < 0.40:
-                                self._add({
-                                    'id': 'A01-IDOR', 'owasp_id': 'A01:2025', 'category': 'owasp',
-                                    'name': 'IDOR — Insecure Direct Object Reference',
-                                    'severity': 'medium', 'confidence': 'low',
-                                    'description': f'Changing numeric parameter `{key}` returns a different valid resource.',
-                                    'impact': "Unauthorized access to other users' data",
-                                    'recommendation': 'Validate object ownership on every request. Use UUIDs.',
-                                    'evidence': f'?{key}={vals[0]} vs ?{key}={test_id} — different valid responses',
-                                    'cvss': '5.8',
-                                })
-                        except Exception:
-                            pass
-
+                    r = self.session.get(
+                        test_url,
+                        timeout=DEFAULT_TIMEOUT,
+                    )
+                except requests.RequestException:
+                    continue
+                
+                similarity = difflib.SequenceMatcher(
+                    None,
+                    baseline,
+                    r.text[:5000],
+                ).ratio()
+                
+                if (
+                    r.status_code == 200
+                    and len(r.text) > 500
+                    and similarity < 0.40
+                    and abs(len(r.text) - len(response.text)) > 100
+                ):
+                    self._add({
+                        "id": "A01-IDOR",
+                        "owasp_id": "A01:2025",
+                        "category": "owasp",
+                        "name": "Potential IDOR (Insecure Direct Object Reference)",
+                        "severity": "medium",
+                        "confidence": "low",
+                        "description": f"Changing numeric parameter '{key}' returned a different valid resource.",
+                        "impact": "May allow unauthorized access to another user's data.",
+                        "recommendation": "Validate object ownership server-side and use unpredictable identifiers (UUIDs).",
+                        "evidence": (
+                            f"Parameter: {key}\n"
+                            f"Original Value: {original_id}\n"
+                            f"Modified Value: {modified_id}\n"
+                            f"URL: {test_url}\n"
+                            f"Status: {r.status_code}"
+                        ),
+                        "cvss": "5.8",
+                    })
+                    break
+            
         # ── A02 — Cryptographic Failures ─────────────────────────────────────
-        if self.url.startswith('http://') and 'localhost' not in self.url:
+        
+        if (
+            self.parsed.scheme == "http"
+            and self.hostname not in ("localhost", "127.0.0.1", "::1")
+        ):
             self._add({
-                'id': 'A02-HTTPS', 'owasp_id': 'A02:2025', 'category': 'owasp',
-                'name': 'No HTTPS — Cleartext Transmission',
-                'severity': 'critical', 'confidence': 'high',
-                'description': 'Site served over unencrypted HTTP.',
-                'impact': 'Credential theft, session hijacking, MITM attacks',
-                'recommendation': 'Obtain TLS certificate. Redirect all HTTP to HTTPS. Enable HSTS.',
-                'evidence': f'URL: {self.url}',
-                'cvss': '7.5',
+                "id": "A02-HTTPS",
+                "owasp_id": "A02:2025",
+                "category": "owasp",
+                "name": "No HTTPS - Cleartext Transmission",
+                "severity": "critical",
+                "confidence": "high",
+                "description": "The application is served over unencrypted HTTP.",
+                "impact": "Credentials, cookies and other sensitive traffic may be intercepted.",
+                "recommendation": "Redirect all HTTP traffic to HTTPS and deploy a valid TLS certificate.",
+                "evidence": (
+                    f"URL: {self.url}\n"
+                    f"Scheme: HTTP"
+                ),
+                "cvss": "7.5",
             })
-
-        if self.url.startswith('https://'):
-            hsts = h.get('strict-transport-security', '').lower()
+            
+        if self.parsed.scheme == "https":
+            
+            hsts = headers.get("Strict-Transport-Security", "").lower()
+            
             if not hsts:
+                
                 self._add({
-                    'id': 'A02-HSTS', 'owasp_id': 'A02:2025', 'category': 'owasp',
-                    'name': 'HSTS Header Not Configured',
-                    'severity': 'low', 'confidence': 'high',
-                    'description': 'HTTPS response missing Strict-Transport-Security header.',
-                    'impact': 'Browsers may allow insecure HTTP connections before HTTPS is enforced.',
-                    'recommendation': 'Add: Strict-Transport-Security: max-age=31536000; includeSubDomains',
-                    'evidence': 'Response missing Strict-Transport-Security header',
-                    'cvss': '3.7',
+                    "id": "A02-HSTS",
+                    "owasp_id": "A02:2025",
+                    "category": "owasp",
+                    "name": "HSTS Header Missing",
+                    "severity": "low",
+                    "confidence": "high",
+                    "description": "HTTPS responses do not include the Strict-Transport-Security header.",
+                    "impact": "Browsers may allow insecure HTTP connections before HTTPS is enforced.",
+                    "recommendation": "Configure HSTS with max-age=31536000; includeSubDomains.",
+                    "evidence": (
+                        f"URL: {self.url}\n"
+                        f"Header: Strict-Transport-Security (missing)"
+                    ),
+                    "cvss": "3.7",
                 })
-            elif 'max-age=0' in hsts:
+                
+            elif "max-age=0" in hsts:
+                
                 self._add({
-                    'id': 'A02-HSTS-ZERO', 'owasp_id': 'A02:2025', 'category': 'owasp',
-                    'name': 'HSTS Effectively Disabled (max-age=0)',
-                    'severity': 'low', 'confidence': 'high',
-                    'description': 'HSTS header present but max-age=0 disables it.',
-                    'impact': 'Browsers will not enforce HTTPS-only communication.',
-                    'recommendation': 'Set a positive max-age such as 31536000.',
-                    'evidence': f'Strict-Transport-Security: {hsts}',
-                    'cvss': '3.1',
+                    "id": "A02-HSTS-ZERO",
+                    "owasp_id": "A02:2025",
+                    "category": "owasp",
+                    "name": "HSTS Disabled",
+                    "severity": "low",
+                    "confidence": "high",
+                    "description": "The HSTS policy is effectively disabled (max-age=0).",
+                    "impact": "Browsers will not enforce HTTPS-only communication.",
+                    "recommendation": "Use a positive max-age such as 31536000.",
+                    "evidence": (
+                        f"Strict-Transport-Security: {hsts}"
+                    ),
+                    "cvss": "3.1",
                 })
+                
             else:
+                
                 try:
-                    max_age = int(re.search(r'max-age=(\d+)', hsts).group(1))
+                    max_age = int(re.search(r"max-age=(\d+)", hsts).group(1))
+                    
                     if 0 < max_age < 86400:
                         self._add({
-                            'id': 'A02-HSTS-WEAK', 'owasp_id': 'A02:2025', 'category': 'owasp',
-                            'name': 'Weak HSTS Configuration',
-                            'severity': 'info', 'confidence': 'high',
-                            'description': 'HSTS max-age is very short.',
-                            'impact': 'Browsers may not retain HTTPS enforcement long-term.',
-                            'recommendation': 'Use max-age=31536000.',
-                            'evidence': f'Strict-Transport-Security: {hsts}',
-                            'cvss': '0.0',
+                            "id": "A02-HSTS-WEAK",
+                            "owasp_id": "A02:2025",
+                            "category": "owasp",
+                            "name": "Weak HSTS Configuration",
+                            "severity": "info",
+                            "confidence": "high",
+                            "description": "The configured HSTS max-age is shorter than recommended.",
+                            "impact": "Browsers may not retain HTTPS enforcement for long.",
+                            "recommendation": "Use max-age=31536000 or longer.",
+                            "evidence": (
+                                f"Strict-Transport-Security: {hsts}"
+                            ),
+                            "cvss": "0.0",
                         })
-                except Exception:
+                        
+                    if "includesubdomains" not in hsts:
+                        self._add({
+                            "id": "A02-HSTS-SUBDOMAINS",
+                            "owasp_id": "A02:2025",
+                            "category": "owasp",
+                            "name": "HSTS Does Not Cover Subdomains",
+                            "severity": "info",
+                            "confidence": "high",
+                            "description": "The HSTS policy does not include the includeSubDomains directive.",
+                            "impact": "Subdomains may still be accessed over HTTP.",
+                            "recommendation": "Add the includeSubDomains directive if appropriate.",
+                            "evidence": (
+                                f"Strict-Transport-Security: {hsts}"
+                            ),
+                            "cvss": "0.0",
+                        })
+                        
+                    if "preload" not in hsts:
+                        self._add({
+                            "id": "A02-HSTS-PRELOAD",
+                            "owasp_id": "A02:2025",
+                            "category": "owasp",
+                            "name": "HSTS Preload Not Enabled",
+                            "severity": "info",
+                            "confidence": "high",
+                            "description": "The HSTS preload directive is not present.",
+                            "impact": "The domain cannot be included in browser preload lists.",
+                            "recommendation": "Consider adding the preload directive after meeting browser preload requirements.",
+                            "evidence": (
+                                f"Strict-Transport-Security: {hsts}"
+                            ),
+                            "cvss": "0.0",
+                        })
+                        
+                except (AttributeError, ValueError):
                     pass
-
-        # ── A04 — Rate Limiting on Login ──────────────────────────────────────
-        if not self.is_trusted and self.results.get('auth', {}).get('status') != 'success':
-            login_forms = soup.find_all('form', action=lambda a: a and any(
-                x in str(a).lower() for x in ['login', 'signin', 'auth']))
-            login_forms = login_forms or soup.find_all('form')
+                
+        # ── A04 — Insecure Design (Login Rate Limiting) ──────────────────────
+        if (
+            not self.is_trusted
+            and self.results.get("auth", {}).get("status") != "success"
+        ):
+            login_forms = soup.find_all(
+                "form",
+                action=lambda action: action
+                and any(
+                    keyword in str(action).lower()
+                    for keyword in ("login", "signin", "auth")
+                ),
+            )
+            
+            if not login_forms:
+                login_forms = soup.find_all("form")
+                
             for form in login_forms[:2]:
-                if form.find_all('input', {'type': 'password'}):
-                    try:
-                        action = form.get('action', self.url)
-                        if not action.startswith('http'):
-                            action = self.url + '/' + action.lstrip('/')
-                        responses = [
-                            self.session.post(action,
-                                                data={'username': 'scanner_test', 'password': 'wrong'},
-                                                timeout=4, allow_redirects=False)
-                            for _ in range(10)
-                        ]
-                        last = responses[-1]
-                        bl = last.text.lower()
-                        rate_limited = (last.status_code == 429
-                                        or any(x in bl for x in
-                                                ['too many requests', 'rate limit', 'captcha',
-                                                'temporarily blocked', 'locked']))
-                        if not rate_limited:
-                            self._add({
-                                'id': 'A04-RATELIMIT', 'owasp_id': 'A04:2025', 'category': 'owasp',
-                                'name': 'No Rate Limiting on Login',
-                                'severity': 'low', 'confidence': 'low',
-                                'description': 'Login accepts unlimited requests without lockout.',
-                                'impact': 'Brute-force credential attacks',
-                                'recommendation': 'Implement rate limiting, CAPTCHA, and account lockout.',
-                                'evidence': f'10 rapid POST requests to {action} — no lockout',
-                                'cvss': '3.7',
-                            })
-                    except Exception:
-                        pass
-                    break
-
-        # ── A05 — Security Misconfiguration (headers) ─────────────────────────
-        sec_headers = {
-            'content-security-policy': ('Content-Security-Policy', 'medium', '5.3'),
-            'x-frame-options': ('X-Frame-Options', 'low', '3.1'),
-            'x-content-type-options': ('X-Content-Type-Options', 'low', '3.1'),
-        }
-        optional_headers = {
-            'referrer-policy': 'Referrer-Policy',
-            'permissions-policy': 'Permissions-Policy',
-            'cross-origin-embedder-policy': 'Cross-Origin-Embedder-Policy',
-            'cross-origin-opener-policy': 'Cross-Origin-Opener-Policy',
-        }
-        missing = [(n, s, c) for k, (n, s, c) in sec_headers.items() if k not in h]
-        missing_opt = [n for k, n in optional_headers.items() if k not in h]
-        if missing:
-            sev = 'medium' if any(s == 'medium' for _, s, _ in missing) else 'low'
-            cvss = '5.3' if sev == 'medium' else '3.1'
-            ev = 'Missing: ' + ', '.join(f'{n} (CVSS {c})' for n, _, c in missing)
-            if missing_opt:
-                ev += ' | Optional Missing: ' + ', '.join(missing_opt)
-            self._add({
-                'id': 'A05-HEADERS', 'owasp_id': 'A05:2025', 'category': 'owasp',
-                'name': 'Missing Security Headers',
-                'severity': sev, 'confidence': 'high',
-                'description': f'{len(missing)}/{len(sec_headers)} important security headers absent.',
-                'impact': 'Increased exposure to XSS, clickjacking, and MIME-sniffing.',
-                'recommendation': 'Configure missing headers in your web server or framework.',
-                'evidence': ev,
-                'cvss': cvss,
-            })
-
-        # ── A06 — Vulnerable Components ──────────────────────────────────────
-        js_libs = [
-            (r'jquery[/-](\d+\.\d+\.?\d*)', 'jQuery', '3.7.0'),
-            (r'bootstrap[/-](\d+\.\d+\.?\d*)', 'Bootstrap', '5.3.0'),
-            (r'angular[/-](\d+\.\d+\.?\d*)', 'Angular', '17.0.0'),
-            (r'react[/-](\d+\.\d+\.?\d*)', 'React', '18.0.0'),
-            (r'vue[/-](\d+\.\d+\.?\d*)', 'Vue.js', '3.3.0'),
-        ]
-        for pattern, lib, safe_ver in js_libs:
-            m = re.search(pattern, body, re.I)
-            if m:
-                ver = m.group(1)
-                if [int(x) for x in re.findall(r'\d+', ver)] < [int(x) for x in re.findall(r'\d+', safe_ver)]:
-                    self._add({
-                        'id': f'A06-{lib.upper().replace(".", "").replace(" ", "")}',
-                        'owasp_id': 'A06:2025', 'category': 'owasp',
-                        'name': f'Outdated Component — {lib} v{ver}',
-                        'severity': 'medium', 'confidence': 'medium',
-                        'description': f'{lib} v{ver} is outdated (safe: v{safe_ver}).',
-                        'impact': 'XSS, prototype pollution, component-specific CVEs',
-                        'recommendation': f'Update {lib} to v{safe_ver} or latest stable.',
-                        'evidence': f'Detected {lib} v{ver} in page source',
-                        'cvss': '6.1',
-                    })
-
-        # ── A08 — SRI ─────────────────────────────────────────────────────────
-        scripts = soup.find_all('script', src=True)
-        ext_no_sri = [s['src'] for s in scripts
-                    if any(cdn in s['src'] for cdn in ['cdn.', 'cdnjs.', 'jsdelivr.', 'unpkg.'])
-                    and not s.get('integrity')]
-        if ext_no_sri:
-            self._add({
-                'id': 'A08-SRI', 'owasp_id': 'A08:2025', 'category': 'owasp',
-                'name': 'Missing Subresource Integrity (SRI)',
-                'severity': 'medium', 'confidence': 'high',
-                'description': f'{len(ext_no_sri)} CDN scripts loaded without integrity checks.',
-                'impact': 'Supply chain attack if CDN is compromised',
-                'recommendation': 'Add integrity+crossorigin attributes (https://www.srihash.org).',
-                'evidence': f'No SRI: {ext_no_sri[0]}',
-                'cvss': '6.8',
-            })
-
-        # ── A10 — SSRF ────────────────────────────────────────────────────────
-        if self.parsed.query and not self.is_trusted:
-            params = urllib.parse.parse_qs(self.parsed.query)
-            ssrf_params = [k for k in params if any(x in k.lower() for x in
-                            ['url', 'redirect', 'next', 'dest', 'path', 'link', 'src', 'uri', 'fetch', 'load'])]
-            if ssrf_params:
-                self._add({
-                    'id': 'A10-SSRF', 'owasp_id': 'A10:2025', 'category': 'owasp',
-                    'name': 'Potential SSRF — URL-Like Parameters',
-                    'severity': 'info', 'confidence': 'low',
-                    'description': f'Parameters {ssrf_params} may trigger server-side URL fetching.',
-                    'impact': 'Internal network enumeration, cloud metadata exfiltration, RCE',
-                    'recommendation': 'Validate/whitelist all server-side URL destinations.',
-                    'evidence': f'URL-like params: {", ".join(ssrf_params)}',
-                    'cvss': '0.0',
-                })
-
-    # ─────────────────────────────────────────────────────────────────────────
-    def _check_injection(self, base_resp, soup):
-        """
-        Runs SQL, XSS, SSTI, LFI, CSRF, and XXE checks across discovered URLs.
-        Skips trusted domains entirely. Each finding ID is reported only once.
-        """
-        targets = self.discovered_urls or [self.url]
-
-        if self.is_trusted:
-            return  # Skip injection checks on trusted domains
-
-        print(f"Injection scan starting on {len(targets)} pages")
-
-        found = {
-            'sqli_error': False, 'sqli_time': False, 'sqli_boolean': False,
-            'xss_reflect': False, 'xss_stored': False, 'csrf': False,
-            'ssti': False, 'lfi': False, 'xxe': False, 'xxe_out': False, 'xxe_in': False,
+                if not form.find("input", {"type": "password"}):
+                    continue
+                
+                try:
+                    action = urllib.parse.urljoin(
+                        response.url,
+                        form.get("action") or response.url,
+                    )
+                    
+                    responses = [
+                        self.session.post(
+                            action,
+                            data={
+                                "username": "scanner_test",
+                                "password": "wrong_password",
+                            },
+                            timeout=DEFAULT_TIMEOUT,
+                            allow_redirects=False,
+                        )
+                        for _ in range(10)
+                    ]
+                    
+                    last = responses[-1]
+                    body_lower = last.text.lower()
+                    
+                    rate_limited = (
+                        last.status_code == 429
+                        or any(
+                            marker in body_lower
+                            for marker in (
+                                "too many requests",
+                                "rate limit",
+                                "captcha",
+                                "temporarily blocked",
+                                "account locked",
+                                "try again later",
+                            )
+                        )
+                    )
+                    
+                    if not rate_limited:
+                        self._add({
+                            "id": "A04-RATE-LIMIT",
+                            "owasp_id": "A04:2025",
+                            "category": "owasp",
+                            "name": "Login Form Lacks Rate Limiting",
+                            "severity": "low",
+                            "confidence": "medium",
+                            "description": (
+                                "Multiple failed login attempts were accepted "
+                                "without visible throttling or lockout."
+                            ),
+                            "impact": (
+                                "May allow brute-force or credential stuffing attacks."
+                            ),
+                            "recommendation": (
+                                "Implement request throttling, account lockout, "
+                                "CAPTCHA, or MFA."
+                            ),
+                            "evidence": (
+                                f"10 consecutive failed login attempts to {action} "
+                                "completed without rate limiting."
+                            ),
+                            "cvss": "3.7",
+                        })
+                        
+                except requests.RequestException:
+                    pass
+                
+                break
+            
+        # ── A05 — Security Misconfiguration (Security Headers) ──────────────────────
+        
+        headers_lower = {k.lower(): v for k, v in headers.items()}
+        
+        required_headers = {
+            "content-security-policy": (
+                "Content-Security-Policy",
+                "medium",
+                "5.3",
+            ),
+            "x-frame-options": (
+                "X-Frame-Options",
+                "low",
+                "3.1",
+            ),
+            "x-content-type-options": (
+                "X-Content-Type-Options",
+                "low",
+                "3.1",
+            ),
         }
         
-        for i, target in enumerate(targets, 1):
-            print(f"[{i}/{len(targets)}] {target}")
-
-        for target in targets:
-            parsed = urllib.parse.urlparse(target)
-            path_lower = parsed.path.lower()
-            ext = ('.' + path_lower.rsplit('.', 1)[-1]) if ('.' in path_lower.split('/')[-1]) else ''
-            if ext in SKIP_EXTENSIONS:
+        optional_headers = {
+            "referrer-policy": "Referrer-Policy",
+            "permissions-policy": "Permissions-Policy",
+            "cross-origin-opener-policy": "Cross-Origin-Opener-Policy",
+            "cross-origin-embedder-policy": "Cross-Origin-Embedder-Policy",
+        }
+        
+        missing_required = [
+            (display, severity, cvss)
+            for key, (display, severity, cvss) in required_headers.items()
+            if key not in headers_lower
+        ]
+        
+        missing_optional = [
+            display
+            for key, display in optional_headers.items()
+            if key not in headers_lower
+        ]
+        
+        if missing_required:
+            
+            severity = (
+                "medium"
+                if any(s == "medium" for _, s, _ in missing_required)
+                else "low"
+            )
+            
+            cvss = "5.3" if severity == "medium" else "3.1"
+            
+            evidence = (
+                f"URL: {self.url}\n"
+                "Missing Required Headers:\n"
+                + "\n".join(f"- {name}" for name, _, _ in missing_required)
+            )
+            
+            if missing_optional:
+                evidence += (
+                    "\n\nMissing Optional Headers:\n"
+                    + "\n".join(f"- {name}" for name in missing_optional)
+                )
+                
+            self._add({
+                "id": "A05-HEADERS",
+                "owasp_id": "A05:2025",
+                "category": "owasp",
+                "name": "Missing Security Headers",
+                "severity": severity,
+                "confidence": "high",
+                "description": (
+                    f"{len(missing_required)} required security header(s) "
+                    "are missing from the HTTP response."
+                ),
+                "impact": (
+                    "Missing security headers increase exposure to "
+                    "cross-site scripting (XSS), clickjacking, "
+                    "MIME-sniffing, and other browser-based attacks."
+                ),
+                "recommendation": (
+                    "Configure the missing security headers at the web server "
+                    "or application level. At minimum implement "
+                    "Content-Security-Policy, X-Frame-Options, and "
+                    "X-Content-Type-Options."
+                ),
+                "evidence": evidence,
+                "cvss": cvss,
+            })
+            
+        # ── A06 — Vulnerable and Outdated Components ───────────────────────────────
+        
+        js_libs = [
+            (r"jquery[/-](\d+\.\d+\.?\d*)", "jQuery", "3.7.0"),
+            (r"bootstrap[/-](\d+\.\d+\.?\d*)", "Bootstrap", "5.3.0"),
+            (r"angular[/-](\d+\.\d+\.?\d*)", "Angular", "17.0.0"),
+            (r"react[/-](\d+\.\d+\.?\d*)", "React", "18.0.0"),
+            (r"vue[/-](\d+\.\d+\.?\d*)", "Vue.js", "3.3.0"),
+        ]
+        
+        for pattern, library, minimum_version in js_libs:
+            
+            match = re.search(pattern, body, re.IGNORECASE)
+            
+            if not match:
                 continue
-
+            
+            detected_version = match.group(1)
+            
             try:
-                page_resp = self.session.get(target, timeout=8, allow_redirects=True)
-                if page_resp.status_code >= 400:
+                if self._version_tuple(detected_version) >= self._version_tuple(minimum_version):
                     continue
-                if 'text/html' not in page_resp.headers.get('content-type', '').lower():
-                    continue
-                page_soup = BeautifulSoup(page_resp.text, 'html.parser')
             except Exception:
                 continue
-
-            try:
-                baseline_resp = self.session.get(target, timeout=8)
-                baseline_text = baseline_resp.text
-            except Exception:
-                baseline_text = ''
-
-            test_params = self._extract_injectable_params(target, page_soup)
-            test_params = {
-                k: v
-                for k, v in test_params.items()
-                if str(v).strip()
-            }
-
-            # ── SQL Injection — Error-Based ───────────────────────────────────
-            if not found['sqli_error']:
-                if self._baseline_has_sql_error(baseline_text):
-                    pass  # Skip — page already has SQL errors
-                else:
-                    SQL_ERROR_PAYLOADS = ("'","\"","')","';","' OR '1'='1","\" OR \"1\"=\"1","'--",)
-                    for payload in SQL_ERROR_PAYLOADS:
-                        if found['sqli_error']:
-                            break
-                        db_params = [k for k in test_params if self._is_db_param(k, target)]
-                        for param_key in db_params[:4]:
-                            new_params = dict(test_params)
-                            new_params[param_key] = payload
-                            test_url = parsed._replace(
-                                query=urllib.parse.urlencode(new_params)
-                            ).geturl()
-                            try:
-                                r = self.session.get(test_url, timeout=8)
-                                matched = None
-                                for pat in SQL_ERROR_PATTERNS:
-                                    m = re.search(pat, r.text, re.I)
-                                    if m and m.group(0).lower() not in baseline_text.lower():
-                                        matched = m.group(0)
-                                        break
-                                if matched:
-                                    self._add({
-                                        'id': 'SQL-ERROR', 'category': 'injection',
-                                        'name': 'SQL Injection — Error-Based',
-                                        'severity': 'high', 'confidence': 'high',
-                                        'description': 'DB error returned after SQL meta-character injection.',
-                                        'impact': 'Unauthorized DB access, data disclosure, auth bypass.',
-                                        'recommendation': 'Use parameterized queries. Never expose DB errors.',
-                                        'evidence': (f'URL: {target} | Param: `{param_key}` | '
-                                                    f'Payload: `{payload}` | Error: {matched[:120]}'),
-                                        'cvss': '8.1',
-                                    })
-                                    found['sqli_error'] = True
-                                    break
-                            except Exception:
-                                pass
-            # ── SQL Injection — Boolean-Based ─────────────────────────────────
-            if not found['sqli_boolean']:
-
-                db_params = [k for k in test_params if self._is_db_param(k, target)]
-
-                for param_key in db_params[:4]:
-
-                    original_value = str(test_params.get(param_key, "")).strip()
-
-                    if not original_value:
+            
+            self._add({
+                "id": f"A06-{library.upper().replace('.', '').replace(' ', '')}",
+                "owasp_id": "A06:2025",
+                "category": "owasp",
+                "name": f"Outdated Component — {library} v{detected_version}",
+                "severity": "medium",
+                "confidence": "high",
+                "description": (
+                    f"{library} version {detected_version} appears older than the "
+                    f"recommended minimum version ({minimum_version})."
+                ),
+                "impact": (
+                    "Outdated third-party components may contain publicly known "
+                    "security vulnerabilities such as XSS, prototype pollution, "
+                    "or other library-specific CVEs."
+                ),
+                "recommendation": (
+                    f"Upgrade {library} to version {minimum_version} or a newer "
+                    "supported release and remove vulnerable legacy versions."
+                ),
+                "evidence": (
+                    f"URL: {self.url}\n"
+                    f"Library: {library}\n"
+                    f"Detected Version: {detected_version}\n"
+                    f"Recommended Minimum Version: {minimum_version}"
+                ),
+                "cvss": "6.1",
+            })
+            
+        # ── A07 — Authentication Failures (Rate Limiting) ─────────────────────
+        
+        if (
+            not self.is_trusted
+            and self.results.get("auth", {}).get("status") != "success"
+        ):
+            
+            login_forms = soup.find_all(
+                "form",
+                action=lambda a: a and any(
+                    x in str(a).lower()
+                    for x in ("login", "signin", "auth")
+                ),
+            )
+            
+            if not login_forms:
+                login_forms = soup.find_all("form")
+                
+            for form in login_forms[:2]:
+                
+                if not form.find("input", {"type": "password"}):
+                    continue
+                
+                action = urllib.parse.urljoin(
+                    self.url,
+                    form.get("action") or self.url,
+                )
+                
+                login_session = requests.Session()
+                login_session.headers.update(self.session.headers)
+                
+                payload = {}
+                
+                for field in form.find_all("input"):
+                    name = field.get("name")
+                    if not name:
                         continue
-
-                    for true_payload, false_payload in SQL_BOOLEAN_PAYLOADS:
-                        SQL_BOOLEAN_PAYLOADS = (
-                            (" AND 1=1", " AND 1=2"),
-                            ("' AND '1'='1", "' AND '1'='2"),
+                    
+                    field_type = (field.get("type") or "text").lower()
+                    
+                    if field_type == "password":
+                        payload[name] = "WrongPassword123!"
+                        
+                    elif field_type in ("text", "email"):
+                        payload[name] = "scanner@example.com"
+                        
+                    elif field_type == "hidden":
+                        payload[name] = field.get("value", "")
+                        
+                try:
+                    
+                    responses = []
+                    
+                    for _ in range(10):
+                        responses.append(
+                            login_session.post(
+                                action,
+                                data=payload,
+                                timeout=DEFAULT_TIMEOUT,
+                                allow_redirects=False,
+                            )
                         )
-
-                        true_params = dict(test_params)
-                        false_params = dict(test_params)
-
-                        true_params[param_key] = original_value + true_payload
-                        false_params[param_key] = original_value + false_payload
-
-                        true_url = parsed._replace(
-                            query=urllib.parse.urlencode(true_params)
-                        ).geturl()
-
-                        false_url = parsed._replace(
-                            query=urllib.parse.urlencode(false_params)
-                        ).geturl()
-
-                        try:
-                            true_resp = self.session.get(true_url, timeout=8)
-                            false_resp = self.session.get(false_url, timeout=8)
-
-                        except requests.RequestException:
-                            continue
-
-                        status_changed = (
-                            true_resp.status_code != false_resp.status_code
+                        
+                    last = responses[-1]
+                    body_lower = last.text.lower()
+                    
+                    rate_limited = (
+                        last.status_code == 429
+                        or any(
+                            marker in body_lower
+                            for marker in (
+                                "too many requests",
+                                "rate limit",
+                                "captcha",
+                                "temporarily blocked",
+                                "locked",
+                            )
                         )
-
-                        length_delta = abs(
-                            len(true_resp.text) - len(false_resp.text)
-                        )
-
-                        if status_changed or length_delta > 300:
-
-                            self._add({
-                                'id': 'SQL-BOOLEAN',
-                                'category': 'injection',
-                                'name': 'Potential SQL Injection — Boolean-Based',
-                                'severity': 'high',
-                                'confidence': 'medium',
-                                'description':
-                                    'Application responded differently to true and false SQL conditions.',
-                                'impact':
-                                    'May allow blind SQL injection and database extraction.',
-                                'recommendation':
-                                    'Use parameterized queries and validate user input.',
-                                'evidence':
-                                    (
-                                        f'URL: {target} | '
-                                        f'Param: `{param_key}` | '
-                                        f'Length Difference: {length_delta} bytes | '
-                                        f'Status: {true_resp.status_code}/{false_resp.status_code}'
-                                    ),
-                                'cvss': '7.5',
-                            })
-
-                            found['sqli_boolean'] = True
-                            break
-
-                    if found['sqli_boolean']:
+                    )
+                    
+                    if not rate_limited:
+                        self._add({
+                            "id": "A07-RATELIMIT",
+                            "owasp_id": "A07:2025",
+                            "category": "owasp",
+                            "name": "Login Endpoint Missing Rate Limiting",
+                            "severity": "low",
+                            "confidence": "medium",
+                            "description": "Multiple rapid login attempts were accepted without throttling or account lockout.",
+                            "impact": "May allow automated credential guessing and brute-force attacks.",
+                            "recommendation": "Implement rate limiting, account lockout, CAPTCHA, or progressive delays.",
+                            "evidence": (
+                                f"URL: {action}\n"
+                                f"Method: POST\n"
+                                f"Attempts: 10\n"
+                                f"Last Status: {last.status_code}"
+                            ),
+                            "cvss": "3.7",
+                        })
+                        
+                except requests.RequestException:
+                    pass
+                
+                break
+            
+        # ── A08 — Software and Data Integrity Failures (SRI) ───────────────────────
+        
+        external_scripts = []
+        
+        for script in soup.find_all("script", src=True):
+            
+            src = script["src"].strip().lower()
+            
+            if not any(cdn in src for cdn in SRI_CDN_HINTS):
+                continue
+            
+            if script.has_attr("integrity"):
+                continue
+            
+            external_scripts.append(script["src"])
+            
+        if external_scripts:
+            
+            preview = "\n".join(f"- {s}" for s in external_scripts[:5])
+            
+            if len(external_scripts) > 5:
+                preview += f"\n...and {len(external_scripts) - 5} more"
+                
+            self._add({
+                "id": "A08-SRI",
+                "owasp_id": "A08:2025",
+                "category": "owasp",
+                "name": "Missing Subresource Integrity (SRI)",
+                "severity": "medium",
+                "confidence": "high",
+                "description": (
+                    f"{len(external_scripts)} externally hosted JavaScript "
+                    "resource(s) are loaded without Subresource Integrity."
+                ),
+                "impact": (
+                    "If a third-party CDN or hosted JavaScript resource is "
+                    "compromised, malicious code may execute in users' browsers."
+                ),
+                "recommendation": (
+                    "Use the integrity attribute together with "
+                    "crossorigin='anonymous' for externally hosted JavaScript "
+                    "resources."
+                ),
+                "evidence": (
+                    f"URL: {self.url}\n\n"
+                    "External scripts without SRI:\n"
+                    f"{preview}"
+                ),
+                "cvss": "6.8",
+            })
+            
+        # ── A09 — Security Logging & Monitoring Failures ─────────────────────
+        
+        debug_patterns = (
+            "traceback (most recent call last)",
+            "stack trace",
+            "exception occurred",
+            "nullpointerexception",
+            "system.nullreferenceexception",
+            "sql syntax",
+            "warning:",
+            "fatal error",
+            "notice:",
+            "debug=true",
+            "werkzeug debugger",
+            "__debugger__",
+            "django version",
+            "asp.net",
+            "laravel",
+            "symfony exception",
+        )
+        
+        body_lower = body.lower()
+        
+        if any(pattern in body_lower for pattern in debug_patterns):
+            self._add({
+                "id": "A09-DEBUG",
+                "owasp_id": "A09:2025",
+                "category": "owasp",
+                "name": "Debug Information Exposed",
+                "severity": "medium",
+                "confidence": "high",
+                "description": (
+                    "The application exposes debugging or exception details "
+                    "to users."
+                ),
+                "impact": (
+                    "Internal implementation details may aid attackers during "
+                    "reconnaissance and exploitation."
+                ),
+                "recommendation": (
+                    "Disable debug mode and replace detailed exceptions with "
+                    "generic error pages."
+                ),
+                "evidence": "Application response contains debugging or exception information.",
+                "cvss": "5.3",
+            })
+            
+        # ── A10 — Server-Side Request Forgery (SSRF) ──────────────────────────
+        
+        if not self.is_trusted and self.parsed.query:
+            
+            params = urllib.parse.parse_qs(self.parsed.query)
+            
+            ssrf_hints = {
+                "url", "uri", "dest", "destination",
+                "redirect", "next", "return",
+                "link", "src", "path",
+                "fetch", "load", "image",
+                "proxy", "callback", "feed"
+            }
+            
+            suspected = []
+            
+            for key, values in params.items():
+                
+                key_lower = key.lower()
+                
+                if any(hint in key_lower for hint in ssrf_hints):
+                    suspected.append(key)
+                    continue
+                
+                for value in values:
+                    value = value.lower()
+                    
+                    if (
+                        value.startswith(("http://", "https://"))
+                        or re.match(r"^\d{1,3}(\.\d{1,3}){3}", value)
+                    ):
+                        suspected.append(key)
                         break
-
-            # ── SQL Injection — Time-Based ────────────────────────────────────
-            if not found['sqli_time']:
-                db_params = [k for k in test_params if self._is_db_param(k, target)]
-                if db_params:
-
-                        baseline_times = []
-
-                        for _ in range(3):
-                            try:
-                                t0 = t.time()
-                                self.session.get(target, timeout=10)
-                                baseline_times.append(t.time() - t0)
-                            except requests.RequestException:
-                                pass
-
-                        if not baseline_times:
-                            continue
-
-                        baseline_elapsed = sum(baseline_times) / len(baseline_times)
-
-                        for param_key in db_params[:4]:
-                            SQL_TIME_PAYLOADS = [
-                                ("MySQL", "' AND SLEEP(3)-- "),
-                                ("PostgreSQL", "';SELECT pg_sleep(3)--"),
-                                ("MSSQL", "';WAITFOR DELAY '0:0:3'--"),
-                                ("Oracle", "';DBMS_LOCK.SLEEP(3)--"),
-                            ]
-                            for db, payload in SQL_TIME_PAYLOADS:
-
+                    
+            if suspected:
+                
+                confidence = (
+                    "medium"
+                    if any(
+                        any(v.lower().startswith(("http://", "https://"))
+                            for v in params[p])
+                        for p in suspected
+                    )
+                    else "low"
+                )
+                
+                self._add({
+                    "id": "A10-SSRF",
+                    "owasp_id": "A10:2025",
+                    "category": "owasp",
+                    "name": "Potential Server-Side Request Forgery (SSRF)",
+                    "severity": "info",
+                    "confidence": confidence,
+                    "description": (
+                        "The application contains URL-like parameters that may "
+                        "be used for server-side resource fetching."
+                    ),
+                    "impact": (
+                        "If user-controlled URLs are fetched without validation, "
+                        "an attacker could access internal services, cloud metadata, "
+                        "or other protected resources."
+                    ),
+                    "recommendation": (
+                        "Validate and whitelist allowed destinations. "
+                        "Block internal IP ranges, localhost, and metadata endpoints."
+                    ),
+                    "evidence": (
+                        f"Potential SSRF parameters: {', '.join(sorted(set(suspected)))}"
+                    ),
+                    "cvss": "0.0",
+                })
+                
+    # ─────────────────────────────────────────────────────────────────────────
+    
+    def _check_injection(self, response, soup): # A03 - Injection (SQL, XSS, SSTI, LFI, CSRF, XXE)
+        
+        if self.is_trusted:
+            return
+        
+        targets = self.discovered_urls or [self.url]
+        
+        print(f"[Injection] {len(targets)} page(s) queued", flush=True)
+        
+        found = {
+            "sqli_error": False,
+            "sqli_time": False,
+            "sqli_boolean": False,
+            "xss_reflect": False,
+            "xss_stored": False,
+            "csrf": False,
+            "ssti": False,
+            "lfi": False,
+            "xxe": False,
+            "xxe_out": False,
+            "xxe_in": False,
+        }
+        
+        for index, target in enumerate(targets, start=1):
+            
+            print(
+                f"[Injection] [{index}/{len(targets)}] {target}",
+                flush=True,
+            )
+            
+            parsed = urllib.parse.urlparse(target)
+            
+            path = parsed.path.lower()
+            filename = path.rsplit("/", 1)[-1]
+            extension = (
+                f".{filename.rsplit('.', 1)[-1]}"
+                if "." in filename
+                else ""
+            )
+            
+            if extension in SKIP_EXTENSIONS:
+                continue
+            
+            try:
+                response = self.session.get(
+                    target,
+                    timeout=DEFAULT_TIMEOUT,
+                    allow_redirects=True,
+                )
+                
+                if response.status_code >= 400:
+                    continue
+                
+                content_type = response.headers.get(
+                    "Content-Type",
+                    "",
+                ).lower()
+                
+                if "html" not in content_type:
+                    continue
+                
+            except requests.RequestException:
+                continue
+            
+            page_soup = BeautifulSoup(
+                response.text,
+                "html.parser",
+            )
+            
+            baseline_text = response.text
+            
+            test_params = {
+                key: value
+                for key, value in self._extract_injectable_params(
+                    target,
+                    page_soup,
+                ).items()
+                if str(value).strip()
+            }
+            
+            if not test_params:
+                continue
+            
+            # ── SQL Injection — Error-Based ───────────────────────────────────
+            
+            if not found["sqli_error"]:
+                
+                if self._baseline_has_sql_error(baseline_text):
+                    pass  # Page already exposes SQL errors
+                
+                else:
+                    
+                    db_params = [
+                        key
+                        for key in test_params
+                        if self._is_db_param(key, target)
+                    ]
+                    
+                    if db_params:
+                        
+                        for payload in SQL_ERROR_PAYLOADS:
+                            
+                            for param_key in db_params[:4]:
+                                
                                 new_params = dict(test_params)
                                 new_params[param_key] = payload
-
+                                
                                 test_url = parsed._replace(
                                     query=urllib.parse.urlencode(new_params)
                                 ).geturl()
-
+                                
                                 try:
-                                    t1 = t.time()
-                                    self.session.get(test_url, timeout=12)
-                                    elapsed = t.time() - t1
-
-                                    if elapsed >= (baseline_elapsed + 2.8):
-                                        self._add({
-                                            'id': 'SQL-TIME',
-                                            'category': 'injection',
-                                            'name': f'Potential SQL Injection — Time-Based Blind ({db})',
-                                            'severity': 'high',
-                                            'confidence': 'medium',
-                                            'description': 'Response time increased significantly after a time-delay payload.',
-                                            'impact': 'Blind SQL injection enabling data extraction.',
-                                            'recommendation': 'Use parameterized queries. Validate all user input.',
-                                            'evidence': (
-                                                f'URL: {target} | '
-                                                f'Param: `{param_key}` | '
-                                                f'DB: {db} | '
-                                                f'Payload: `{payload}` | '
-                                                f'Response: {elapsed:.2f}s '
-                                                f'(baseline: {baseline_elapsed:.2f}s)'
-                                            ),
-                                            'cvss': '7.5',
-                                        })
-
-                                        found['sqli_time'] = True
-                                        break
-
+                                    response = self.session.get(
+                                        test_url,
+                                        timeout=DEFAULT_TIMEOUT,
+                                    )
+                                    
                                 except requests.RequestException:
                                     continue
-
-                            if found['sqli_time']:
-                                break
-
-            # ── Reflected Cross-Site Scripting (XSS) ─────────────────────────────────────────────────
-            if not found['xss_reflect'] and test_params:
-                XSS_PAYLOADS = (
-                    "<script>alert(1)</script>",
-                    '"><script>alert(1)</script>',
-                    "'><script>alert(1)</script>",
-                    "<img src=x onerror=alert(1)>",
-                    "<svg/onload=alert(1)>",
-                    "<body onload=alert(1)>",
-                    '"><svg/onload=alert(1)>',
-                    "'><svg/onload=alert(1)>",
-                    "<iframe src=javascript:alert(1)>",
-                    "<a href=javascript:alert(1)>click</a>",
-                    "<input type=text value='><script>alert(1)</script>'>",
-                    "<textarea><script>alert(1)</script></textarea>",
-                    "<div style='display:none'><script>alert(1)</script></div>",
-                    "<object data='javascript:alert(1)'></object>",
-                    "<embed src='javascript:alert(1)'></embed>",
-                    "<link rel='stylesheet' href='javascript:alert(1)'>",
-                    "<meta http-equiv='refresh' content='0;url=javascript:alert(1)'>",
-                )
-                for payload in XSS_PAYLOADS:
-                    if found['xss_reflect']:
-                        break
-                    for param_key in list(test_params)[:5]:
-                        if not param_key:
-                            continue
-
-                        if param_key.lower() in SKIP_PARAMS:
-                            continue
-                        new_params = dict(test_params)
-                        new_params[param_key] = payload
-                        test_url = parsed._replace(
-                            query=urllib.parse.urlencode(new_params)
-                        ).geturl()
-                        try:
-                            r = self.session.get(test_url, timeout=8)
-                            if 'text/html' and 'application/xhtml+xml' not in r.headers.get('content-type', '').lower():
-                                continue
-                            rbody = r.text
-                            payload_lower = payload.lower()
-                            escaped = html.escape(payload).lower()
-
-                            reflected_raw = payload_lower in rbody.lower()
-                            only_escaped = escaped in rbody.lower() and not reflected_raw
-
-                            if reflected_raw and not only_escaped:
-                                if self._check_xss_context(rbody, payload):
+                                
+                                matched = None
+                                
+                                for pattern in SQL_ERROR_PATTERNS:
+                                    match = re.search(
+                                        pattern,
+                                        response.text,
+                                        re.IGNORECASE,
+                                    )
+                                    
+                                    if (
+                                        match
+                                        and match.group(0).strip().lower()
+                                        not in baseline_text.lower()
+                                    ):
+                                        matched = match.group(0).strip()
+                                        break
+                                    
+                                if matched:
+                                    
                                     self._add({
-                                        'id': 'XSS-REFLECT', 'category': 'injection',
-                                        'name': 'Potential Reflected XSS',
-                                        'severity': 'medium', 'confidence': 'medium',
-                                        'description': 'Input reflected into HTML without sufficient encoding.',
-                                        'impact': 'Attackers may inject malicious client-side scripts.',
-                                        'recommendation': 'Apply context-aware output encoding.',
-                                        'evidence': (f'URL: {target} | Param: `{param_key}` | '
-                                                    f'Payload: `{payload}`'),
-                                        'cvss': '5.3',
+                                        "id": "SQL-ERROR",
+                                        "category": "injection",
+                                        "name": "SQL Injection — Error-Based",
+                                        "severity": "high",
+                                        "confidence": "high",
+                                        "description": (
+                                            "Database error messages were returned "
+                                            "after SQL metacharacter injection."
+                                        ),
+                                        "impact": (
+                                            "May allow database enumeration, "
+                                            "authentication bypass, or data disclosure."
+                                        ),
+                                        "recommendation": (
+                                            "Use parameterized queries, validate input, "
+                                            "and never expose database errors."
+                                        ),
+                                        "evidence": (
+                                            f"URL: {test_url}\n"
+                                            f"Parameter: {param_key}\n"
+                                            f"Payload: {payload}\n"
+                                            f"Matched Error: {matched}"
+                                        ),
+                                        "cvss": "8.1",
                                     })
-                                    found['xss_reflect'] = True
+                                    
+                                    found["sqli_error"] = True
                                     break
-                        except Exception:
-                            pass
-
-            # ── Stored Cross-Site Scripting (XSS) ────────────────────────────────────────────────────
-            if not found['xss_stored']:
-                for form in page_soup.find_all('form')[:5]:
-                    if found['xss_stored']:
-                        break
-                    if form.get('method', '').upper() not in ('POST', ''):
-                        continue
-
-                    # Collect injectable text fields
-                    text_fields = []
-                    all_fields = {}
-                    for inp in form.find_all(['input', 'textarea']):
-                        n = (inp.get('name') or '').strip()
-                        if not n:
-                            continue
-                        itype = inp.get('type', 'text').lower()
-                        if itype in ('submit', 'button', 'image', 'reset', 'file'):
-                            continue
-                        val = (inp.get('value') or '').strip()
-                        # Preserve CSRF token value as-is
-                        if any(tok in n.lower() for tok in ['token', 'csrf', 'nonce']):
-                            all_fields[n] = val
-                        elif itype == 'hidden':
-                            all_fields[n] = val
-                        elif n.lower() not in SKIP_PARAMS:
-                            text_fields.append(n)
-                            all_fields[n] = val
-
-                    if not text_fields:
-                        continue
-
-                    action = form.get('action', target)
-                    if not action.startswith('http'):
-                        action = urllib.parse.urljoin(target, action)
-
-                    try:
-                        xss_payload = XSS_PAYLOADS[0]
-                        post_data = dict(all_fields)
-                        post_data[text_fields[0]] = (
-                            post_data.get(text_fields[0], '') + xss_payload
-                        )
-
-                        response = self.session.post(action, data=post_data, timeout=8, allow_redirects=True)
-                        verify = self.session.get(response.url, timeout=8)
-                        vbody = verify.text
-                        escaped_pl = html.escape(xss_payload).lower()
-                        raw_found = xss_payload.lower() in vbody.lower()
-                        only_escaped = escaped_pl in vbody.lower() and not raw_found
-
-                        if raw_found and not only_escaped and self._check_xss_context(vbody, xss_payload):
-                            self._add({
-                                'id': 'XSS-STORED', 'category': 'injection',
-                                'name': 'Potential Stored XSS',
-                                'severity': 'medium', 'confidence': 'medium',
-                                'description': 'Stored user content reflected without encoding.',
-                                'impact': 'Persistent client-side script injection.',
-                                'recommendation': 'Sanitize input and apply context-aware output encoding.',
-                                'evidence': (f'URL: {target} | Payload persisted after POST, '
-                                            f'found on page revisit'),
-                                'cvss': '5.4',
-                            })
-                            found['xss_stored'] = True
+                            if found["sqli_error"]:
+                                break
+                                
+            # ── SQL Injection — Boolean-Based ────────────────────────────────
+            
+            if not found["sqli_boolean"]:
+                
+                db_params = [
+                    key
+                    for key in test_params
+                    if self._is_db_param(key, target)
+                ]
+                
+                if db_params:
                     
-                    except requests.RequestException:
-                        pass
-
-            # ── Cross-site request forgery (CSRF) ─────────────────────────────────────────────────────────
-            if not found['csrf']:
-                CSRF_TOKEN_NAMES = {
-                    'csrf',
-                    '_csrf',
-                    '_token',
-                    'csrf_token',
-                    'authenticity_token',
-                    'nonce',
-                    '__requestverificationtoken',
-                    'csrfmiddlewaretoken',
-                }
-                has_token = any(
-                    token in field
-                    for field in inputs
-                    for token in CSRF_TOKEN_NAMES
-                )
-                set_cookie = page_resp.headers.get("Set-Cookie", "").lower()
-                has_samesite = (
-                    "samesite=lax" in set_cookie or
-                    "samesite=strict" in set_cookie
-                )
-                for form in page_soup.find_all('form', method=lambda m: m and m.upper() == 'POST'):
-                    inputs = [i.get("name", "").lower() for i in form.find_all("input", {"type": "hidden"})]
-                    has_token = any(tok in field for field in inputs for tok in CSRF_TOKEN_NAMES)
-                    action = urllib.parse.urljoin(
-                        target,
-                        form.get("action", "")
-                    )
-
-                    method = form.get("method", "GET").upper()
-
-                    hidden_fields = [
-                        i.get("name", "")
-                        for i in form.find_all("input", {"type": "hidden"})
-                        if i.get("name")
-                    ]
-                    if not has_token and not has_samesite:
-                        self._add({
-                            'id': 'CSRF-01', 'category': 'injection',
-                            'name': 'Potential CSRF Protection Missing',
-                            'severity': 'info', 'confidence': 'low',
-                            'description': 'POST form without an obvious CSRF token.',
-                            'impact': 'Heuristic only — does not confirm a CSRF vulnerability.',
-                            'recommendation': 'Verify CSRF protections: tokens, SameSite cookies, origin validation.',
-                            'evidence': (
-                                f'Action: {action}\n'
-                                f'Method: {method}\n'
-                                f'Hidden fields: {", ".join(hidden_fields) if hidden_fields else "None"}'
-                            ),
-                            'cvss': '0.0',
-                        })
-                        found['csrf'] = True
-                        break
-
-            # ── Server-Side Template Injection (SSTI) ─────────────────────────────────────────────────────────
-            if not found['ssti'] and test_params:
-                SSTI_PAYLOADS = (
-                    ("{{7*7}}", "49"),          # Jinja2, Twig
-                    ("${7*7}", "49"),           # FreeMarker
-                    ("#{7*7}", "49"),           # Spring EL
-                    ("<%=7*7%>", "49"),         # ERB / JSP
-                    ("{{1337-1288}}", "49"),    # Alternative arithmetic
-                    ("{{7*'7'}}", "7777777"),   # Jinja2/Twig string multiplication
-                )
-                try:
-                    ssti_base = self.session.get(target, timeout=6).text.lower()
-                except Exception:
-                    ssti_base = ''
-
-                for payload, expected in SSTI_PAYLOADS:
-                    if found['ssti']:
-                        break
-                    # Use first non-skip param
-                    for param_key in list(test_params.keys())[:4]:
-
-                        if not param_key:
+                    for param_key in db_params[:4]:
+                        
+                        original_value = str(
+                            test_params.get(param_key, "")
+                        ).strip()
+                        
+                        if not original_value:
                             continue
-
-                        if param_key.lower() in SKIP_PARAMS:
-                            continue
-
-                        new_params = dict(test_params)
-                        new_params[param_key] = payload
-
-                        test_url = parsed._replace(
-                            query=urllib.parse.urlencode(new_params)
-                        ).geturl()
-
-                        try:
-                            r = self.session.get(test_url, timeout=6)
-                            rbody = r.text.lower()
-
-                            # Expected result must appear in response
-                            if not re.search(rf'\b{re.escape(expected)}\b', rbody):
-                                continue
-                            # The literal payload must NOT appear (it should be evaluated)
-                            if payload.lower() in rbody:
-                                continue
-                            # Must not exist in baseline
-                            if re.search(rf'\b{re.escape(expected)}\b', ssti_base):
-                                continue
-                            # Responses must differ meaningfully
-                            sim = difflib.SequenceMatcher(None, ssti_base, rbody).ratio()
-                            if sim > 0.98:
-                                continue
-                            # Extra: confirm the number is in an output context (not in JS/CSS)
-                            idx = rbody.find(expected)
-                            ctx = rbody[max(0, idx - 100): idx + 100]
-                            # Skip if it's inside a JS number or CSS value (not template output)
-                            if re.search(r'(var|let|const|function|px|em|rem|#)\s*' + re.escape(expected), ctx):
+                        
+                        for true_payload, false_payload in SQL_BOOLEAN_PAYLOADS:
+                            
+                            true_params = dict(test_params)
+                            false_params = dict(test_params)
+                            
+                            true_params[param_key] = (
+                                original_value + true_payload
+                            )
+                            
+                            false_params[param_key] = (
+                                original_value + false_payload
+                            )
+                            
+                            true_url = parsed._replace(
+                                query=urllib.parse.urlencode(true_params)
+                            ).geturl()
+                            
+                            false_url = parsed._replace(
+                                query=urllib.parse.urlencode(false_params)
+                            ).geturl()
+                            
+                            try:
+                                
+                                true_response = self.session.get(
+                                    true_url,
+                                    timeout=DEFAULT_TIMEOUT,
+                                )
+                                
+                                false_response = self.session.get(
+                                    false_url,
+                                    timeout=DEFAULT_TIMEOUT,
+                                )
+                                
+                            except requests.RequestException:
                                 continue
                             
-                            idx = rbody.find(expected)
-
-                            snippet = (
-                                rbody[max(0, idx - 40): idx + 40]
-                                if idx != -1 else "N/A"
+                            status_changed = (
+                                true_response.status_code
+                                != false_response.status_code
                             )
-
-                            self._add({
-                                'id': 'SSTI-01', 'category': 'injection',
-                                'name': 'Potential Server-Side Template Injection',
-                                'severity': 'medium', 'confidence': 'medium',
-                                'description': 'Template syntax may have been evaluated server-side.',
-                                'impact': 'Server-side code execution or sensitive data disclosure.',
-                                'recommendation': 'Never render untrusted input in templates. Use sandboxing.',
-                                'evidence': (
-                                    f'URL: {target}\n'
-                                    f'Parameter: {param_key}\n'
-                                    f'Payload: {payload}\n'
-                                    f'Expected Result: {expected}\n'
-                                    f'Response Snippet: {snippet}'
-                                ),
-                                'cvss': '6.5',
-                            })
-                            found['ssti'] = True
-                        except Exception:
+                            
+                            length_delta = abs(
+                                len(true_response.text)
+                                - len(false_response.text)
+                            )
+                            
+                            if status_changed or length_delta > 300:
+                                
+                                self._add({
+                                    "id": "SQL-BOOLEAN",
+                                    "category": "injection",
+                                    "name": "Potential SQL Injection — Boolean-Based",
+                                    "severity": "high",
+                                    "confidence": "medium",
+                                    "description": (
+                                        "The application responded differently "
+                                        "to logically true and false SQL conditions."
+                                    ),
+                                    "impact": (
+                                        "May allow blind SQL injection and "
+                                        "database extraction."
+                                    ),
+                                    "recommendation": (
+                                        "Use parameterized queries and "
+                                        "validate all user input."
+                                    ),
+                                    "evidence": (
+                                        f"True URL: {true_url}\n"
+                                        f"False URL: {false_url}\n"
+                                        f"Parameter: {param_key}\n"
+                                        f"Status Codes: "
+                                        f"{true_response.status_code} / "
+                                        f"{false_response.status_code}\n"
+                                        f"Response Length Difference: "
+                                        f"{length_delta} bytes"
+                                    ),
+                                    "cvss": "7.5",
+                                })
+                                
+                                found["sqli_boolean"] = True
+                                break
+                            
+                        if found["sqli_boolean"]:
+                            break
+                        
+            # ── SQL Injection — Time-Based ────────────────────────────────────
+            
+            if not found['sqli_time']:
+                
+                db_params = [k for k in test_params if self._is_db_param(k, target)]
+                
+                if db_params:
+                    
+                    # Measure baseline response time
+                    baseline_times = []
+                    
+                    for _ in range(3):
+                        try:
+                            start = t.perf_counter()
+                            self.session.get(target, timeout=10)
+                            baseline_times.append(t.perf_counter() - start)
+                        except requests.RequestException:
                             pass
-
-            # ── Local File Inclusion (LFI) ─────────────────────────────────────
-            if not found['lfi'] and test_params:
-
-                for param_key in list(test_params.keys())[:5]:
-
-                    if not param_key:
+                        
+                    if not baseline_times:
                         continue
-
-                    if param_key.lower() in SKIP_PARAMS:
-                        continue
-
-                    if param_key.lower() not in FILE_PARAMS:
-                        continue
-
-                    for payload in LFI_PAYLOADS:
-                        LFI_PAYLOADS = (
-                            "../../../../etc/passwd",
-                            "..%2F..%2F..%2F..%2Fetc%2Fpasswd",
-                            "..\\..\\..\\..\\windows\\win.ini",
-                        )
-
+                    
+                    baseline_elapsed = sum(baseline_times) / len(baseline_times)
+                    
+                    for param_key in db_params[:4]:
+                        
+                        original_value = str(test_params.get(param_key, "")).strip()
+                        
+                        if not original_value:
+                            continue
+                        
+                        for db, payload in SQL_TIME_PAYLOADS:
+                            
+                            new_params = dict(test_params)
+                            new_params[param_key] = original_value + payload
+                            
+                            test_url = parsed._replace(
+                                query=urllib.parse.urlencode(new_params)
+                            ).geturl()
+                            
+                            try:
+                                start = t.perf_counter()
+                                self.session.get(test_url, timeout=12)
+                                elapsed = t.perf_counter() - start
+                                
+                            except requests.RequestException:
+                                continue
+                            
+                            # Require ~3 second delay over baseline
+                            if elapsed >= baseline_elapsed + 2.8:
+                                
+                                self._add({
+                                    'id': 'SQL-TIME',
+                                    'category': 'injection',
+                                    'name': f'Potential SQL Injection — Time-Based Blind ({db})',
+                                    'severity': 'high',
+                                    'confidence': 'medium',
+                                    'description': 'Response time increased significantly after a database time-delay payload.',
+                                    'impact': 'Blind SQL injection allowing database enumeration and extraction.',
+                                    'recommendation': 'Use parameterized queries and validate all user input.',
+                                    'evidence': (
+                                        f'URL: {target} | '
+                                        f'Param: `{param_key}` | '
+                                        f'DB: {db} | '
+                                        f'Payload: `{payload}` | '
+                                        f'Response: {elapsed:.2f}s '
+                                        f'(baseline: {baseline_elapsed:.2f}s)'
+                                    ),
+                                    'cvss': '7.5',
+                                })
+                                
+                                found['sqli_time'] = True
+                                break
+                            
+                        if found['sqli_time']:
+                            break
+                        
+            # ── Reflected Cross-Site Scripting (XSS) ───────────────────────────────
+            
+            if not found["xss_reflect"] and test_params:
+                
+                for payload in XSS_PAYLOADS:
+                    
+                    if found["xss_reflect"]:
+                        break
+                    
+                    for param_key in list(test_params)[:5]:
+                        
+                        if not param_key or param_key.lower() in SKIP_PARAMS:
+                            continue
+                        
                         new_params = dict(test_params)
                         new_params[param_key] = payload
-
+                        
                         test_url = parsed._replace(
                             query=urllib.parse.urlencode(new_params)
                         ).geturl()
-
+                        
                         try:
-                            r = self.session.get(test_url, timeout=8)
-
+                            response = self.session.get(test_url, timeout=8)
+                            
+                            content_type = response.headers.get("content-type", "").lower()
+                            
+                            if (
+                                "text/html" not in content_type
+                                and "application/xhtml+xml" not in content_type
+                            ):
+                                continue
+                            
+                            response_body = response.text
+                            response_lower = response_body.lower()
+                            
+                            payload_lower = payload.lower()
+                            escaped_payload = html.escape(payload).lower()
+                            
+                            reflected_raw = payload_lower in response_lower
+                            reflected_escaped = escaped_payload in response_lower
+                            
+                            if (
+                                reflected_raw
+                                and not reflected_escaped
+                                and self._check_xss_context(response_body, payload)
+                            ):
+                                self._add({
+                                    "id": "XSS-REFLECT",
+                                    "category": "injection",
+                                    "name": "Potential Reflected XSS",
+                                    "severity": "medium",
+                                    "confidence": "medium",
+                                    "description": "Input reflected into an executable HTML context without sufficient output encoding.",
+                                    "impact": "Attackers may execute arbitrary JavaScript in victims' browsers.",
+                                    "recommendation": "Apply context-aware output encoding and Content Security Policy (CSP).",
+                                    "evidence": (
+                                        f"URL: {target} | "
+                                        f"Param: `{param_key}` | "
+                                        f"Payload: `{payload}`"
+                                    ),
+                                    "cvss": "5.3",
+                                })
+                                
+                                found["xss_reflect"] = True
+                                break
+                            
                         except requests.RequestException:
                             continue
-
+                        
+            # ── Stored Cross-Site Scripting (XSS) ───────────────────────────────────
+            
+            if not found["xss_stored"]:
+                
+                xss_payload = XSS_PAYLOADS[0]
+                
+                for form in page_soup.find_all("form")[:5]:
+                    
+                    if found["xss_stored"]:
+                        break
+                    
+                    if form.get("method", "").upper() not in ("POST", ""):
+                        continue
+                    
+                    text_fields = []
+                    all_fields = {}
+                    
+                    for inp in form.find_all(["input", "textarea"]):
+                        
+                        field_name = (inp.get("name") or "").strip()
+                        
+                        if not field_name:
+                            continue
+                        
+                        input_type = (inp.get("type") or "text").lower()
+                        
+                        if input_type in (
+                            "submit",
+                            "button",
+                            "image",
+                            "reset",
+                            "file",
+                        ):
+                            continue
+                        
+                        value = (inp.get("value") or "").strip()
+                        
+                        if any(token in field_name.lower() for token in ("token", "csrf", "nonce")):
+                            all_fields[field_name] = value
+                            
+                        elif input_type == "hidden":
+                            all_fields[field_name] = value
+                            
+                        elif field_name.lower() not in SKIP_PARAMS:
+                            text_fields.append(field_name)
+                            all_fields[field_name] = value
+                            
+                    if not text_fields:
+                        continue
+                    
+                    action = urllib.parse.urljoin(
+                        target,
+                        form.get("action") or target
+                    )
+                    
+                    post_data = dict(all_fields)
+                    post_data[text_fields[0]] = (
+                        post_data.get(text_fields[0], "") + xss_payload
+                    )
+                    
+                    try:
+                        response = self.session.post(
+                            action,
+                            data=post_data,
+                            timeout=8,
+                            allow_redirects=True,
+                        )
+                        
+                        verify_response = self.session.get(
+                            response.url,
+                            timeout=8,
+                        )
+                        
+                        content_type = verify_response.headers.get(
+                            "content-type",
+                            "",
+                        ).lower()
+                        
+                        if (
+                            "text/html" not in content_type
+                            and "application/xhtml+xml" not in content_type
+                        ):
+                            continue
+                        
+                        verify_body = verify_response.text
+                        verify_lower = verify_body.lower()
+                        
+                        payload_lower = xss_payload.lower()
+                        escaped_payload = html.escape(xss_payload).lower()
+                        
+                        reflected_raw = payload_lower in verify_lower
+                        reflected_escaped = escaped_payload in verify_lower
+                        
+                        if (
+                            reflected_raw
+                            and not reflected_escaped
+                            and self._check_xss_context(verify_body, xss_payload)
+                        ):
+                            
+                            self._add({
+                                "id": "XSS-STORED",
+                                "category": "injection",
+                                "name": "Potential Stored XSS",
+                                "severity": "medium",
+                                "confidence": "medium",
+                                "description": "User-supplied content was stored and later rendered in an executable HTML context without proper output encoding.",
+                                "impact": "Persistent JavaScript execution affecting all users viewing the stored content.",
+                                "recommendation": "Sanitize user input and apply context-aware output encoding before rendering stored data.",
+                                "evidence": (
+                                    f"URL: {target} | "
+                                    f"Field: `{text_fields[0]}` | "
+                                    f"Payload persisted after POST and was reflected on page revisit."
+                                ),
+                                "cvss": "5.4",
+                            })
+                            
+                            found["xss_stored"] = True
+                            
+                    except requests.RequestException:
+                        continue
+                    
+            # ── Cross-Site Request Forgery (CSRF) ───────────────────────────────────
+            
+            if not found["csrf"]:
+                
+                set_cookie = response.headers.get(
+                    "Set-Cookie",
+                    "",
+                ).lower()
+                
+                has_samesite = "samesite=" in set_cookie
+                
+                for form in page_soup.find_all("form"):
+                    
+                    method = (form.get("method") or "GET").upper()
+                    
+                    if method not in ("POST", "PUT", "PATCH", "DELETE"):
+                        continue
+                    
+                    hidden_fields = [
+                        (field.get("name") or "").lower()
+                        for field in form.find_all("input", {"type": "hidden"})
+                        if field.get("name")
+                    ]
+                    
+                    has_token = any(
+                        token in field
+                        for field in hidden_fields
+                        for token in CSRF_TOKEN_NAMES
+                    )
+                    
+                    if has_token or has_samesite:
+                        continue
+                    
+                    action = urllib.parse.urljoin(
+                        target,
+                        form.get("action") or target,
+                    )
+                    
+                    self._add({
+                        "id": "CSRF-01",
+                        "category": "injection",
+                        "name": "Potential Missing CSRF Protection",
+                        "severity": "info",
+                        "confidence": "low",
+                        "description": (
+                            "State-changing form detected without an obvious CSRF token "
+                            "or SameSite cookie protection."
+                        ),
+                        "impact": (
+                            "Heuristic finding only. Manual verification is required to "
+                            "confirm whether the endpoint is vulnerable to CSRF."
+                        ),
+                        "recommendation": (
+                            "Implement anti-CSRF tokens, SameSite cookies, Origin/Referer "
+                            "validation, and verify CSRF protection on all state-changing endpoints."
+                        ),
+                        "evidence": (
+                            f"Action: {action}\n"
+                            f"Method: {method}\n"
+                            f"Hidden fields: "
+                            f"{', '.join(hidden_fields) if hidden_fields else 'None'}"
+                        ),
+                        "cvss": "0.0",
+                    })
+                    
+                    found["csrf"] = True
+                    break
+                
+            # ── Server-Side Template Injection (SSTI) ───────────────────────────────
+            
+            if not found["ssti"] and test_params:
+                
+                try:
+                    baseline_body = self.session.get(target, timeout=6).text
+                    baseline_lower = baseline_body.lower()
+                    
+                except requests.RequestException:
+                    baseline_body = ""
+                    baseline_lower = ""
+                    
+                for payload, expected in SSTI_PAYLOADS:
+                    
+                    if found["ssti"]:
+                        break
+                    
+                    for param_key in list(test_params)[:4]:
+                        
+                        if not param_key or param_key.lower() in SKIP_PARAMS:
+                            continue
+                        
+                        new_params = dict(test_params)
+                        new_params[param_key] = payload
+                        
+                        test_url = parsed._replace(
+                            query=urllib.parse.urlencode(new_params)
+                        ).geturl()
+                        
+                        try:
+                            response = self.session.get(
+                                test_url,
+                                timeout=6,
+                            )
+                            
+                            content_type = response.headers.get(
+                                "content-type",
+                                "",
+                            ).lower()
+                            
+                            if (
+                                "text/html" not in content_type
+                                and "application/xhtml+xml" not in content_type
+                            ):
+                                continue
+                            
+                            response_body = response.text
+                            response_lower = response_body.lower()
+                            
+                            if not re.search(
+                                rf"\b{re.escape(expected)}\b",
+                                response_lower,
+                            ):
+                                continue
+                            
+                            if payload.lower() in response_lower:
+                                continue
+                            
+                            if re.search(
+                                rf"\b{re.escape(expected)}\b",
+                                baseline_lower,
+                            ):
+                                continue
+                            
+                            similarity = difflib.SequenceMatcher(
+                                None,
+                                baseline_lower,
+                                response_lower,
+                            ).ratio()
+                            
+                            if similarity > 0.98:
+                                continue
+                            
+                            index = response_lower.find(expected)
+                            
+                            context = response_lower[
+                                max(0, index - 100):
+                                index + 100
+                            ]
+                            
+                            if re.search(
+                                r"(var|let|const|function|px|em|rem|#)\s*"
+                                + re.escape(expected),
+                                context,
+                            ):
+                                continue
+                            
+                            snippet = (
+                                response_body[
+                                    max(0, index - 40):
+                                    index + 40
+                                ]
+                                if index != -1
+                                else "N/A"
+                            )
+                            
+                            self._add({
+                                "id": "SSTI-01",
+                                "category": "injection",
+                                "name": "Potential Server-Side Template Injection",
+                                "severity": "medium",
+                                "confidence": "medium",
+                                "description": "Template expression appears to have been evaluated server-side.",
+                                "impact": "May allow server-side code execution or disclosure of sensitive data.",
+                                "recommendation": "Never render untrusted input inside server-side templates. Use sandboxing and proper escaping.",
+                                "evidence": (
+                                    f"URL: {target}\n"
+                                    f"Parameter: {param_key}\n"
+                                    f"Payload: {payload}\n"
+                                    f"Expected Output: {expected}\n"
+                                    f"Response Snippet: {snippet}"
+                                ),
+                                "cvss": "6.5",
+                            })
+                            
+                            found["ssti"] = True
+                            break
+                        
+                        except requests.RequestException:
+                            continue
+                        
+            # ── Local File Inclusion (LFI) ─────────────────────────────────────
+            if not found['lfi'] and test_params:
+                
+                for param_key in list(test_params.keys())[:5]:
+                    
+                    if not param_key:
+                        continue
+                    
+                    if param_key.lower() in SKIP_PARAMS:
+                        continue
+                    
+                    if param_key.lower() not in FILE_PARAMS:
+                        continue
+                    
+                    for payload in LFI_PAYLOADS:
+                        
+                        new_params = dict(test_params)
+                        new_params[param_key] = payload
+                        
+                        test_url = parsed._replace(
+                            query=urllib.parse.urlencode(new_params)
+                        ).geturl()
+                        
+                        try:
+                            r = self.session.get(test_url, timeout=8)
+                            
+                        except requests.RequestException:
+                            continue
+                        
                         body = r.text
-
+                        
                         # Linux detection
                         passwd_matches = re.findall(
                             r'^(root|daemon|bin|nobody):[^:]*:\d+:\d+:',
                             body,
                             re.MULTILINE
                         )
-
+                        
                         # Windows detection
                         windows_detected = (
                             "[extensions]" in body.lower() or
                             "for 16-bit app support" in body.lower()
                         )
-
+                        
                         if len(passwd_matches) >= 3 or windows_detected:
-
+                            
                             snippet = "\n".join(passwd_matches[:3])
-
+                            
                             self._add({
                                 'id': 'LFI-01',
                                 'category': 'injection',
@@ -1641,17 +2737,17 @@ class VulnScanner:
                                 ),
                                 'cvss': '9.1',
                             })
-
+                            
                             found['lfi'] = True
                             break
-
+                        
                     if found['lfi']:
                         break
-
+                    
             # ── XML External Entity (XXE) ───────────────────────────────────────────────────
-
-            page_ct = page_resp.headers.get("content-type", "").lower()
-
+            
+            page_ct = response.headers.get("content-type", "").lower()
+            
             xml_form = any(
                 form.get("enctype", "").lower() in (
                     "text/xml",
@@ -1659,7 +2755,7 @@ class VulnScanner:
                 )
                 for form in page_soup.find_all("form")
             )
-
+            
             if (
                 (
                     "application/xml" in page_ct or
@@ -1669,7 +2765,7 @@ class VulnScanner:
                 )
                 and "XXE-01" not in self._vuln_ids
             ):
-
+                
                 self._add({
                     'id': 'XXE-01',
                     'category': 'injection',
@@ -1689,53 +2785,54 @@ class VulnScanner:
                     ),
                     'cvss': '8.2',
                 })
-
+                
     # ─────────────────────────────────────────────────────────────────────────
+    
     def _check_sensitive_files(self):
         if self._is_trusted_domain(self.url):
             return
-
+        
         try:
             baseline = self.session.get(self.url, timeout=6)
             baseline_text = baseline.text[:10000]
         except requests.RequestException:
             return
-
+        
         for path, name, severity in SENSITIVE_FILES:
             try:
                 test_url = urllib.parse.urljoin(self.url, path)
                 r = self.session.get(test_url, timeout=6, allow_redirects=False)
-
+                
                 if r.status_code != 200:
                     continue
-
+                
                 # Don't process very large files
                 if len(r.content) > 1024 * 1024:   # 1 MB
                     continue
-
+                
                 body = r.text
                 if len(body.strip()) < 10:
                     continue
-
+                
                 sim = difflib.SequenceMatcher(
                     None,
                     baseline_text,
                     body[:10000]
                 ).ratio()
-
+                
                 # Likely custom error page
                 if sim > 0.85:
                     continue
-
+                
                 ct = r.headers.get("Content-Type", "").lower()
-
+                
                 # robots.txt
                 if path == "/robots.txt":
                     has_sensitive = any(
                         p in body.lower()
                         for p in ROBOTS_SENSITIVE_HINTS
                     )
-
+                    
                     self._add({
                         'id': 'FILE-ROBOTS',
                         'category': 'exposure',
@@ -1760,9 +2857,9 @@ class VulnScanner:
                         'cvss': '2.6' if has_sensitive else '0.0',
                     })
                     continue
-
+                
                 filename = path.lstrip("/")
-
+                
                 if filename not in FILE_SIGNATURES:
                     continue
 
@@ -1812,6 +2909,7 @@ class VulnScanner:
                 continue
 
     # ─────────────────────────────────────────────────────────────────────────
+    
     def _check_http_methods(self):
         dangerous = {'TRACE': 'high', 'CONNECT': 'medium', 'PUT': 'low',
                     'DELETE': 'low', 'PATCH': 'info'}
@@ -1846,6 +2944,7 @@ class VulnScanner:
                 pass
 
     # ─────────────────────────────────────────────────────────────────────────
+    
     def _check_cookies(self, resp):
         SESSION_KW = {'session', 'sess', 'auth', 'token', 'jwt', 'login',
                     'sid', 'ssid', 'access', 'csrf', 'identity'}
@@ -1911,6 +3010,7 @@ class VulnScanner:
             })
 
     # ─────────────────────────────────────────────────────────────────────────
+    
     def _check_cors(self):
         try:
             r = self.session.get(self.url, headers={'Origin': 'https://evil.com'}, timeout=8)
@@ -1943,6 +3043,7 @@ class VulnScanner:
             pass
 
     # ─────────────────────────────────────────────────────────────────────────
+    
     def _check_open_redirect(self):
         redirect_params = ['redirect', 'next', 'url', 'return', 'dest',
                             'destination', 'redir', 'target', 'goto', 'link']
@@ -1987,6 +3088,7 @@ class VulnScanner:
                 pass
 
     # ─────────────────────────────────────────────────────────────────────────
+    
     def _check_ssl(self):
         if not self.hostname:
             return
@@ -2029,6 +3131,7 @@ class VulnScanner:
             })
 
     # ─────────────────────────────────────────────────────────────────────────
+    
     def _check_dns(self):
         dns_data = check_dns_security(self.hostname)
         self.results['dns_security'] = dns_data
@@ -2071,6 +3174,7 @@ class VulnScanner:
             })
 
     # ─────────────────────────────────────────────────────────────────────────
+    
     def _detect_waf(self, headers, body):
         h_str = str(headers).lower()
         b_str = body.lower()
@@ -2093,6 +3197,7 @@ class VulnScanner:
             pass
 
     # ─────────────────────────────────────────────────────────────────────────
+    
     def _scan_ports(self):
         try:
             ip = socket.gethostbyname(self.hostname)
@@ -2130,25 +3235,26 @@ class VulnScanner:
                 })
 
     # ─────────────────────────────────────────────────────────────────────────
+    
     def _detect_tech(self, headers, body):
         techs = []
         h = headers
-
+        
         def add_tech(name, cat, ver=None):
             if not any(x['name'].lower() == name.lower() for x in techs):
                 techs.append({'name': name, 'category': cat, 'version': ver})
-
+                
         server = h.get('server', '')
         if server:
             parts = server.split('/')
             add_tech(parts[0].strip(), 'Web Server',
                     parts[1].split(' ')[0] if len(parts) > 1 else None)
-
+            
         powered = h.get('x-powered-by', '')
         if powered:
             parts = powered.split('/')
             add_tech(parts[0].strip(), 'Language', parts[1] if len(parts) > 1 else None)
-
+            
         patterns = [
             (r'wp-content|wp-includes|wp-json', 'WordPress', 'CMS', r'wordpress[\s/]+([\d.]+)'),
             (r'drupal\.org|drupal\.js', 'Drupal', 'CMS', r'Drupal ([\d.]+)'),
@@ -2173,7 +3279,7 @@ class VulnScanner:
             (r'node\.js|nodejs', 'Node.js', 'Runtime', r'node/([\d.]+)'),
             (r'php', 'PHP', 'Language', r'PHP/([\d.]+)'),
         ]
-
+        
         all_text = body + str(headers)
         for pattern, name, cat, ver_pat in patterns:
             if re.search(pattern, all_text, re.I):
@@ -2183,14 +3289,14 @@ class VulnScanner:
                     if m:
                         ver = m.group(1)
                 add_tech(name, cat, ver)
-
+                
         if h.get('cf-ray'):
             add_tech('Cloudflare', 'CDN')
         if self.url.startswith('https://'):
             add_tech('TLS/SSL', 'Security')
-
+            
         self.results['technologies'] = techs
-
+        
         for tech in techs[:4]:
             if tech['version']:
                 cve_data = check_nvd_cves(tech['name'], tech['version'])
@@ -2207,14 +3313,15 @@ class VulnScanner:
                             'evidence': f'CVSS {cve.get("cvss")} — {cve.get("published")}',
                             'cvss': str(cve.get('cvss', '')),
                         })
-
+                        
     # ─────────────────────────────────────────────────────────────────────────
+    
     def _calc_risk_score(self):
         findings = {
             v['id']: v
             for v in self.results['vulnerabilities']
         }.values()
-
+        
         raw = sum(
             SEVERITY_WEIGHTS.get(
                 v.get('severity', 'info').lower(), 0
@@ -2224,5 +3331,5 @@ class VulnScanner:
             )
             for v in findings
         )
-
+        
         return min(round(100 * (1 - math.exp(-raw / 100))), 100)
