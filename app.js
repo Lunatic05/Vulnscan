@@ -2,6 +2,7 @@ const API = 'http://localhost:5000';
 let currentScan = null, scanStartTime = null, timerInterval = null;
 let severityChart = null, categoryChart = null;
 let allHistory = [];
+let authMode = 'none';
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', () => {
@@ -51,16 +52,6 @@ function navigate(page) {
   if (page === 'settings') checkApiStatus();
 }
 
-function showReportTitle() {
-  const title = document.getElementById('reportTitle');
-  if (title) title.style.display = 'block';
-}
-
-function hideReportTitle() {
-  const title = document.getElementById('reportTitle');
-  if (title) title.style.display = 'none';
-}
-
 function toggleSidebar() {
   document.getElementById('sidebar').classList.toggle('collapsed');
   document.getElementById('sidebar').classList.toggle('open');
@@ -91,6 +82,16 @@ function setupScanInput() {
   input.addEventListener('keydown', e => {
     if (e.key === 'Enter') startScan();
   });
+}
+
+function showReportTitle() {
+  const title = document.getElementById('reportTitle');
+  if (title) title.style.display = 'block';
+}
+
+function hideReportTitle() {
+  const title = document.getElementById('reportTitle');
+  if (title) title.style.display = 'none';
 }
 
 // ── Score helpers (FIX 4: thresholds aligned to new logarithmic curve) ────────
@@ -219,6 +220,9 @@ async function startScan() {
   if (!url.startsWith('http')) url = 'https://' + url;
   document.getElementById('targetUrl').value = url.replace('https://', '').replace('http://', '');
 
+  const auth = collectAuthOptions();
+  if (!auth) return;
+
   const opts = {
     scan_owasp:        document.getElementById('optOwasp').checked,
     scan_injection:    document.getElementById('optInjection').checked,
@@ -227,6 +231,7 @@ async function startScan() {
     scan_ssl:          document.getElementById('optSsl').checked,
     scan_dns:          document.getElementById('optDns').checked,
     scan_threat_intel: document.getElementById('optThreat').checked,
+    auth,
   };
 
   document.getElementById('scanBtn').disabled = true;
@@ -240,6 +245,8 @@ async function startScan() {
   startTimer();
   tlog('info', `Target acquired: ${url}`);
   tlog('info', 'Initializing VulnScan 1.0 engine...');
+  if (auth.mode === 'cookie') tlog('info', 'Authenticated scan: session cookie attached');
+  if (auth.mode === 'credentials') tlog('info', `Authenticated scan: logging in as ${auth.username}`);
   setProgress(3, 'Bootstrapping scanner');
 
   try {
@@ -252,7 +259,7 @@ async function startScan() {
     const data = await resp.json();
     if (data.error) throw new Error(data.error);
     tlog('ok', `Scan job created: ID=${data.scan_id}`);
-    pollScan(data.scan_id, url);
+    pollScan(data.scan_id, url, auth);
   } catch (err) {
     tlog('warn', `Service unreachable (${err.message}) — running demo mode`);
     runDemoScan(url, opts);
@@ -287,7 +294,7 @@ function setProgress(pct, label) {
   document.getElementById('termProgLabel').textContent = `${Math.round(pct)}% — ${label}`;
 }
 
-function pollScan(scanId, url) {
+function pollScan(scanId, url, auth = { mode: 'none' }) {
   const steps = [
     [8,  'DNS resolution & host reachability',          'info'],
     [15, 'Fetching response headers & body',             'info'],
@@ -303,6 +310,11 @@ function pollScan(scanId, url) {
     [88, 'Checking sensitive files & CORS...',          'warn'],
     [94, 'Saving results to MySQL...',                  'ok'],
   ];
+  if (auth.mode === 'cookie') {
+    steps.unshift([5, 'Attaching session cookie to scanner session...', 'info']);
+  } else if (auth.mode === 'credentials') {
+    steps.unshift([5, `Authenticating as ${auth.username}...`, 'info']);
+  }
   let i = 0;
   const logInterval = setInterval(() => {
     if (i < steps.length) {
@@ -357,7 +369,7 @@ function runDemoScan(url, opts) {
       stopTimer();
       tlog('ok', 'Demo mode — showing sample data (start service for live scans)');
       document.getElementById('activeScanBadge').style.display = 'none';
-      setTimeout(() => renderResults(getDemoData(url), 'DEMO-001', url), 600);
+      setTimeout(() => renderResults(getDemoData(url, opts.auth), 'DEMO-001', url), 600);
       document.getElementById('scanBtn').disabled = false;
     }
   }, 700);
@@ -375,6 +387,20 @@ function renderResults(data, scanId, url) {
   document.getElementById('rScanId').textContent   = scanId;
   document.getElementById('rDuration').textContent = duration + 's';
   document.getElementById('rWaf').textContent      = data.waf || 'Not detected';
+
+  const authInfo  = data.auth || { mode: 'none', status: 'not_attempted' };
+  const authLabel = {
+    success: 'AUTHENTICATED', applied: 'COOKIE APPLIED',
+    failed: 'LOGIN FAILED', error: 'AUTH ERROR', not_attempted: 'NONE',
+  }[authInfo.status] || authInfo.status.toUpperCase();
+  const authColor = {
+    success: '#39ff14', applied: '#39ff14',
+    failed: '#ff003c', error: '#ff003c', not_attempted: '#6a8a9a',
+  }[authInfo.status] || '#6a8a9a';
+  const rAuthEl = document.getElementById('rAuth');
+  rAuthEl.textContent   = authLabel;
+  rAuthEl.style.color   = authColor;
+  rAuthEl.title         = authInfo.detail || '';
 
   // FIX 4: Use updated scoreColor() helper that matches the new logarithmic curve
   const score   = data.score || 0;
@@ -912,17 +938,76 @@ function saveSettings() {
   checkApiStatus();
 }
 
-function flashInput() {
-  const el = document.getElementById('targetUrl');
+function flashInput(id = 'targetUrl') {
+  const el = document.getElementById(id);
+  if (!el) return;
   el.style.borderColor = '#ff003c';
   el.focus();
   setTimeout(() => el.style.borderColor = '', 1000);
 }
 
+// ── Authenticated Scanning ──────────────────────────────────────────────────
+function toggleAuthPanel() {
+  const body = document.getElementById('authPanelBody');
+  const chevron = document.getElementById('authChevron');
+  const isOpen = body.style.display !== 'none';
+  body.style.display = isOpen ? 'none' : '';
+  chevron.classList.toggle('open', !isOpen);
+}
+
+function setAuthMode(mode) {
+  authMode = mode;
+  document.querySelectorAll('.auth-mode-btn').forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
+  document.getElementById('authModeCookie').style.display = mode === 'cookie' ? '' : 'none';
+  document.getElementById('authModeCreds').style.display  = mode === 'credentials' ? '' : 'none';
+
+  const pill = document.getElementById('authModePill');
+  pill.textContent = mode === 'none' ? 'OFF' : mode === 'cookie' ? 'COOKIE' : 'CREDENTIALS';
+  pill.classList.toggle('on', mode !== 'none');
+}
+
+// Reads the active auth mode's fields into a payload for the /scan request.
+// Returns null (and flags the offending input) if a selected mode is incomplete.
+function collectAuthOptions() {
+  if (authMode === 'cookie') {
+    const cookie = document.getElementById('authCookieStr').value.trim();
+    if (!cookie) {
+      flashInput('authCookieStr');
+      tlog('warn', 'Authenticated scan selected but no session cookie was provided');
+      return null;
+    }
+    return { mode: 'cookie', cookie };
+  }
+
+  if (authMode === 'credentials') {
+    const username = document.getElementById('authUsername').value.trim();
+    const password = document.getElementById('authPassword').value;
+    if (!username || !password) {
+      flashInput(!username ? 'authUsername' : 'authPassword');
+      tlog('warn', 'Authenticated scan selected but username/password is missing');
+      return null;
+    }
+    return {
+      mode: 'credentials',
+      login_url:      document.getElementById('authLoginUrl').value.trim(),
+      username, password,
+      username_field: document.getElementById('authUserField').value.trim(),
+      password_field: document.getElementById('authPassField').value.trim(),
+    };
+  }
+
+  return { mode: 'none' };
+}
+
 // ── Demo Data ─────────────────────────────────────────────────────────────────
-function getDemoData(url) {
+function getDemoData(url, auth) {
+  const authMode = (auth && auth.mode) || 'none';
   return {
     status: 'complete', score: 74, waf: 'Cloudflare',
+    auth: authMode === 'none'
+      ? { mode: 'none', status: 'not_attempted', detail: '' }
+      : { mode: authMode, status: authMode === 'cookie' ? 'applied' : 'success',
+          detail: 'Demo mode — session simulated, no live request made' },
     dns_security: { spf: null, dmarc: null, dnssec: false, caa: null },
     ssl_info: {
       valid: true, days_remaining: 12, expires: 'Apr 22 00:00:00 2025 GMT',
