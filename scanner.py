@@ -19,6 +19,7 @@ import tldextract
 from collections import deque
 import html
 from urllib.parse import urlparse
+import time # tmp
 
 requests.packages.urllib3.disable_warnings()
 
@@ -254,7 +255,7 @@ class VulnScanner:
 
         self.parsed = urllib.parse.urlparse(self.url)
         self.hostname = self.parsed.hostname or ""
-        self.is_trusted = self._check_trusted_domain()
+        self.is_trusted = self._is_trusted_domain(self.url)
 
         # HTTP session
         self.session = requests.Session()
@@ -444,6 +445,8 @@ class VulnScanner:
 
     # ─────────────────────────────────────────────────────────────────────────
     def run(self):
+        print(f"[Scanner] Starting scan: {self.url}", flush=True)
+
         try:
             resp = self.session.get(self.url, allow_redirects=True, timeout=10)
         except Exception as e:
@@ -505,7 +508,12 @@ class VulnScanner:
 
         self.results['threat_intel'] = threat_intel
         self.results['score'] = self._calc_risk_score()
+        print(f"[Scanner] Finished scan: {self.url} "
+            f"({len(self.results['vulnerabilities'])} findings, score {self.results['score']})", flush=True)
         return {**self.results, 'status': 'complete', 'url': self.url}
+    
+    # ────────────────────────────────────────────────────────────────────────
+    # Debug code
 
     # ─────────────────────────────────────────────────────────────────────────
     def _extract_injectable_params(self, target_url, page_soup):
@@ -856,12 +864,17 @@ class VulnScanner:
         
         if self._is_trusted_domain(target):
             return # Skip injection checks on trusted domains
+        
+        print(f"Injection scan starting on {len(targets)} pages")
 
         found = {
             'sqli_error': False, 'sqli_time': False, 'sqli_boolean': False,
             'xss_reflect': False, 'xss_stored': False, 'csrf': False,
             'ssti': False, 'lfi': False, 'xxe': False, 'xxe_out': False, 'xxe_in': False,
         }
+        
+        for i, target in enumerate(targets, 1):
+            print(f"[{i}/{len(targets)}] {target}")
 
         for target in targets:
             parsed = urllib.parse.urlparse(target)
