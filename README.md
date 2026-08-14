@@ -34,13 +34,13 @@ vulnscan/
 - A01 — Broken Access Control + IDOR detection
 - A02 — Cryptographic failures + HSTS + SSL cert analysis
 - A03 — Injection (via dedicated injection suite)
-- A04 — Insecure Design (rate limit testing)
+- A04 — Insecure Design (Login Rate Limiting)
 - A05 — Security Misconfiguration (7 header checks, server disclosure, HTTP methods)
-- A06 — Vulnerable Components (jQuery, Bootstrap, React, Vue, Angular)
-- A07 — Auth Failures (cookie flags, autocomplete)
-- A08 — Software Integrity (SRI checks)
-- A09 — Logging Failures
-- A10 — SSRF parameter detection
+- A06 — Vulnerable and Outdated Components (jQuery, Bootstrap, React, Vue, Angular)
+- A07 — Authentication Failures (Rate Limiting, cookie flags, autocomplete)
+- A08 — Software and Data Integrity Failures (SRI)
+- A09 — Security Logging & Monitoring Failures
+- A10 — Server-Side Request Forgery (SSRF)
 
 ### Injection Suite (8 Vectors)
 - SQL Injection (error-based + time-based blind)
